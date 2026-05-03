@@ -24,6 +24,20 @@ uuid = { version = "1.20.0", features = ["v4"] }
 directories = "6.0.0"
 tauri-plugin-fs = "2"
 tauri-plugin-dialog = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+image = { version = "0.25", features = ["png", "jpeg"] }
+tiff = "0.10"
+geojson = "0.24"
+shapefile = "0.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+bytes = "1"
+futures = { version = "0.3", features = ["std"] }
+anyhow = "1"
+thiserror = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[dev-dependencies]
+tempfile = "3"
+wiremock = "0.6"

@@ -1,0 +1,1 @@
+//! cog module — Plan A

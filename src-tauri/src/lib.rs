@@ -1,4 +1,5 @@
 pub mod history;
+pub mod core;
 mod mocks;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
