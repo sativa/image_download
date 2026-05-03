@@ -279,3 +279,21 @@ Known minor follow-ups:
 - MapPanel attribution does not update on source change (snapshot at construct).
 - MapPanel drop-target div has a Svelte a11y warning (no ARIA role).
 - `chrono_iso_now()` returns `"epoch:N"` strings; Plan A will switch to ISO 8601 via `chrono`.
+
+---
+
+## Plan D Phases 2-4 Implementation Status (2026-05-04)
+
+✅ `.github/workflows/ci.yml`: Linux frontend (lint+test+build) + Linux Rust (fmt+clippy+test) + macOS×2 + Windows build matrix on every PR / main push. paths-ignore avoids burning CI on legacy/ or docs-only changes.
+✅ `.github/workflows/release.yml`: tag `v*.*.*` (incl. `-rc1` etc.) triggers tauri-action across the same three runners, uploads to a single GitHub Release **draft**. Signing env slots wired (inactive until secrets added).
+✅ `.githooks/pre-push`: runs actionlint locally (no-op if not installed). Activated by `pnpm install` via the `prepare` script.
+✅ `docs/RELEASING.md`: full release procedure including pre-release tags, rollback, SemVer policy.
+✅ `docs/SIGNING.md`: current Gatekeeper/SmartScreen UX + step-by-step future enablement for Apple Developer ID and Windows OV/EV certs.
+✅ Top-level `README.md` cross-links both docs.
+
+Pending (require user action — cannot be performed by the agent):
+- **Task 2.3**: push to a PR branch + observe CI green + configure GitHub branch protection requiring CI checks before merge to main.
+- **Task 3.2**: tag `v0.0.1-test` and push to validate end-to-end release pipeline; then delete the test release + tag.
+- **Task 3.4**: tag `v0.0.1` (real first milestone) and push; leave the produced GitHub Release as draft until Plan A/B land.
+
+Outstanding: Plan A (real Rust modules) and Plan B (real commands replacing `src-tauri/src/mocks/`) are not yet planned in this repo.
