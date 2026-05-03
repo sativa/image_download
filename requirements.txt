@@ -1,0 +1,7 @@
+requests
+Pillow
+numpy
+geopandas
+shapely
+rasterio
+matplotlib

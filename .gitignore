@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Tauri (will be used after refactor)
+src-tauri/target/
+src-tauri/Cargo.lock
+node_modules/
+dist/
+.svelte-kit/
+
+# Output / cache
+out/
+*.tif
+*.tif.tmp
+download_summary.json
