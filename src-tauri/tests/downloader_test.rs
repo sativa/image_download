@@ -60,7 +60,7 @@ async fn download_one_gives_up_after_max_retries() {
     assert!(err.to_string().contains("503") || err.to_string().contains("retries"));
 }
 
-use imagery_downloader_lib::core::downloader::{download_all, DownloadedTile, ProgressUpdate};
+use imagery_downloader_lib::core::downloader::{download_all, ProgressUpdate};
 use imagery_downloader_lib::core::sources::SourceKind;
 use imagery_downloader_lib::core::tiles::TileCoord;
 use std::sync::{Arc, Mutex};
@@ -85,4 +85,29 @@ async fn download_all_empty_returns_empty() {
     ).await;
     assert!(result.is_empty());
     assert!(progress.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn download_all_respects_cancellation() {
+    let progress: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let p2 = progress.clone();
+    let cancel = CancellationToken::new();
+    cancel.cancel(); // pre-cancel
+
+    let cfg = imagery_downloader_lib::core::downloader::DownloadConfig {
+        max_retries: 0,
+        backoff_base: std::time::Duration::ZERO,
+        timeout_per_request: std::time::Duration::from_secs(1),
+    };
+    let result = download_all(
+        (0..5).map(|x| TileCoord { x, y: 0, z: 5 }).collect(),
+        SourceKind::Esri,
+        cfg,
+        4,
+        cancel,
+        move |p| p2.lock().unwrap().push(p),
+    ).await;
+    assert_eq!(result.len(), 5);
+    assert!(result.iter().all(|t| t.bytes.is_none()));
+    assert_eq!(progress.lock().unwrap().len(), 5);
 }
