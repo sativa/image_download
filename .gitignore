@@ -1,26 +1,31 @@
-# macOS
+# OS noise
 .DS_Store
+Thumbs.db
 
-# Python
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Python (legacy/ subtree)
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
 
-# IDE
-.idea/
-.vscode/
-
-# Tauri (will be used after refactor)
-src-tauri/target/
-src-tauri/Cargo.lock
-src-tauri/gen/
+# Node / Vite
 node_modules/
 dist/
+.vite/
 .svelte-kit/
 
-# Output / cache
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/Cargo.lock
+
+# Legacy CLI artifacts
 out/
 *.tif
 *.tif.tmp
