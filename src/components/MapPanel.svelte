@@ -4,6 +4,23 @@
   import "maplibre-gl/dist/maplibre-gl.css";
   import { input } from "../lib/state.svelte";
   import { previewTileUrl } from "../lib/sources";
+  import { parseVectorFile } from "../lib/ipc";
+  import { pushToast } from "../lib/state.svelte";
+
+  let dragOver = $state(false);
+
+  async function handleDrop(e: DragEvent) {
+    e.preventDefault();
+    dragOver = false;
+    const files = Array.from(e.dataTransfer?.files || []);
+    if (!files.length) return;
+    const f = files[0];
+    pushToast(
+      "warn",
+      `Vector file dropped: ${f.name} — drag-drop parsing pending Plan A. Use the picker for now.`,
+    );
+    void parseVectorFile; // imported for Plan B; mark used
+  }
 
   let container: HTMLDivElement;
   let map: maplibregl.Map | null = null;
@@ -144,7 +161,12 @@
   });
 </script>
 
-<div class="wrap">
+<div
+  class="wrap"
+  ondragover={(e) => { e.preventDefault(); dragOver = true; }}
+  ondragleave={() => (dragOver = false)}
+  ondrop={handleDrop}
+>
   <div class="map" bind:this={container}></div>
   <div class="controls">
     {#if drawing}
@@ -153,6 +175,9 @@
       <button onclick={enableDraw}>Draw rectangle</button>
     {/if}
   </div>
+  {#if dragOver}
+    <div class="drop-overlay">Drop vector file…</div>
+  {/if}
 </div>
 
 <style>
@@ -164,5 +189,16 @@
     top: 1rem;
     left: 1rem;
     z-index: 10;
+  }
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 102, 204, 0.4);
+    color: white;
+    display: grid;
+    place-items: center;
+    font-size: 1.5rem;
+    pointer-events: none;
+    z-index: 20;
   }
 </style>
