@@ -27,6 +27,52 @@ pub fn tile_y_to_lat(y: i64, zoom: u32) -> f64 {
     lat_rad.to_degrees()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TileCoord {
+    pub x: i64,
+    pub y: i64,
+    pub z: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TileRange {
+    pub x_min: i64,
+    pub y_min: i64,
+    pub x_max: i64, // inclusive
+    pub y_max: i64, // inclusive
+    pub z: u32,
+}
+
+impl TileRange {
+    pub fn count(&self) -> u64 {
+        ((self.x_max - self.x_min + 1) * (self.y_max - self.y_min + 1)) as u64
+    }
+    pub fn iter(&self) -> impl Iterator<Item = TileCoord> + '_ {
+        let z = self.z;
+        (self.y_min..=self.y_max).flat_map(move |y| {
+            (self.x_min..=self.x_max).map(move |x| TileCoord { x, y, z })
+        })
+    }
+}
+
+/// Compute the inclusive tile range covering the bbox [minLon, minLat, maxLon, maxLat] at zoom.
+/// Bbox is in WGS84; tiles are XYZ web-mercator.
+pub fn range_for_bbox(bbox: [f64; 4], zoom: u32) -> TileRange {
+    let [w, s, e, n] = bbox;
+    let x_min = lon_to_tile_x(w, zoom);
+    let x_max = lon_to_tile_x(e, zoom).max(x_min);
+    let y_min = lat_to_tile_y(n, zoom);
+    let y_max = lat_to_tile_y(s, zoom).max(y_min);
+    let max_idx = (1i64 << zoom) - 1;
+    TileRange {
+        x_min: x_min.clamp(0, max_idx),
+        y_min: y_min.clamp(0, max_idx),
+        x_max: x_max.clamp(0, max_idx),
+        y_max: y_max.clamp(0, max_idx),
+        z: zoom,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +143,40 @@ mod tests {
         let north = tile_y_to_lat(6, 4);
         assert!((west - 90.0).abs() < 0.001);
         assert!((north - 40.97).abs() < 0.1);
+    }
+
+    #[test]
+    fn range_single_tile() {
+        let r = range_for_bbox([0.5, 0.5, 0.6, 0.6], 8);
+        assert_eq!(r.count(), 1);
+    }
+
+    #[test]
+    fn range_known_extent() {
+        // bbox 100..110 lon, 30..40 lat at z=8: ~8 cols (lon) × ~10 rows (lat) ≈ 80 tiles.
+        // (Spec band 50–64 was too narrow: 10° lon at z=8 spans 8 tiles, 10° lat at
+        // mid-latitudes spans ~10 tiles in the mercator projection.)
+        let r = range_for_bbox([100.0, 30.0, 110.0, 40.0], 8);
+        assert!(r.count() >= 70 && r.count() <= 90, "got {}", r.count());
+        assert!(r.x_min < r.x_max);
+        assert!(r.y_min < r.y_max);
+    }
+
+    #[test]
+    fn range_iter_yields_unique_tiles() {
+        let r = range_for_bbox([0.0, 0.0, 1.0, 1.0], 6);
+        let v: Vec<_> = r.iter().collect();
+        let unique: std::collections::HashSet<_> = v.iter().copied().collect();
+        assert_eq!(v.len(), unique.len());
+        assert_eq!(v.len() as u64, r.count());
+    }
+
+    #[test]
+    fn range_clamps_to_world() {
+        let r = range_for_bbox([-181.0, -86.0, 181.0, 86.0], 4);
+        assert_eq!(r.x_min, 0);
+        assert_eq!(r.x_max, 15);
+        assert_eq!(r.y_min, 0);
+        assert_eq!(r.y_max, 15);
     }
 }
