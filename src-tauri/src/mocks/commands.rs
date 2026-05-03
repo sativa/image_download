@@ -276,13 +276,73 @@ pub fn cancel_download(
 }
 
 #[tauri::command]
-pub async fn retry_failed() -> Result<serde_json::Value, String> {
-    Err("not implemented yet (Task 7.4)".into())
+pub async fn retry_failed(
+    app: AppHandle,
+    runner: State<'_, Runner>,
+    download_id: String,
+) -> Result<serde_json::Value, String> {
+    let token = runner.register(download_id.clone());
+    let id_clone = download_id.clone();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        let _ = app_clone.emit(
+            "download://stage",
+            StageEvent {
+                download_id: id_clone.clone(),
+                stage: "downloading".into(),
+            },
+        );
+        for i in 1..=10u32 {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(100)) => {},
+                _ = token.cancelled() => {
+                    let _ = app_clone.emit(
+                        "download://done",
+                        DoneEvent::Err {
+                            download_id: id_clone.clone(),
+                            ok: false,
+                            error: "cancelled".into(),
+                        },
+                    );
+                    return;
+                }
+            }
+            let _ = app_clone.emit(
+                "download://progress",
+                ProgressEvent {
+                    download_id: id_clone.clone(),
+                    completed: i * 10,
+                    total: MOCK_TOTAL,
+                    bytes_downloaded: 0,
+                    current_speed_mbps: 1.0,
+                    elapsed_sec: i as f64 * 0.1,
+                    eta_sec: (10 - i) as f64 * 0.1,
+                },
+            );
+        }
+        let _ = app_clone.emit(
+            "download://done",
+            DoneEvent::Ok {
+                download_id: id_clone,
+                ok: true,
+                output_path: String::new(),
+                preview_path: None,
+                bbox: [0.0; 4],
+                zoom: 0,
+                source_used: String::new(),
+                duration_sec: 1.0,
+                total_tiles: MOCK_TOTAL,
+                failed_tiles: 0,
+                output_size_mb: 0.0,
+            },
+        );
+    });
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 #[tauri::command]
-pub async fn parse_vector_file() -> Result<serde_json::Value, String> {
-    Err("not implemented yet (Task 4.2)".into())
+pub fn parse_vector_file(_path: String) -> Result<serde_json::Value, String> {
+    Err("vector parsing pending Plan A".into())
 }
 
 fn chrono_iso_now() -> String {
