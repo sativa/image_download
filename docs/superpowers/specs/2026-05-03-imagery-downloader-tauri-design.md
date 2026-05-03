@@ -253,3 +253,29 @@ clear_history() → { ok: true }
 1. 旧 `download_imagery.py` 等 Python 脚本：保留在仓库 `legacy/` 子目录或单独分支，避免新用户混淆。
 2. 新仓库结构：`src-tauri/`（Rust）+ `src/`（前端）+ `docs/` + `legacy/`（旧 Python）。
 3. 新 `README.md`：替换当前 Python CLI 文档。
+
+---
+
+## Plan C Implementation Status (2026-05-04)
+
+✅ Frontend UI complete: 3-pane layout (input / map / progress+history).
+✅ Three input modes: numeric form, map rectangle draw, file picker (parse pending Plan A).
+✅ MapLibre raster preview with live source switching (esri/google), native rectangle drawing, fitBounds.
+✅ Mock backend in `src-tauri/src/mocks/`: `start_download` simulates a
+   5-sec download with 50 progress ticks, real CancellationToken-based
+   cancel, real history persistence (atomic write).
+✅ History panel with 10-newest-first cap, dedupe by bbox+zoom+source,
+   click-to-restore.
+✅ 16 vitest unit tests (validators, formatters, IPC wrapper, smoke).
+✅ 6 cargo integration tests for history Store.
+✅ The frontend is final-shape; Plan B replaces only `src-tauri/src/mocks/`.
+
+Pending:
+- Plan A: real `tiles`, `sources`, `downloader`, `stitcher`, `cog`, `vector` modules.
+- Plan B: real Tauri commands wiring Plan A modules into `invoke_handler!`.
+- Plan D Phases 2-4: CI workflow, release workflow, signing docs (deferred).
+
+Known minor follow-ups:
+- MapPanel attribution does not update on source change (snapshot at construct).
+- MapPanel drop-target div has a Svelte a11y warning (no ARIA role).
+- `chrono_iso_now()` returns `"epoch:N"` strings; Plan A will switch to ISO 8601 via `chrono`.

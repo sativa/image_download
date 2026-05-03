@@ -3,10 +3,11 @@
 Desktop application to download satellite XYZ tiles for a bounding box and
 write a Cloud-Optimized GeoTIFF.
 
-> **Status: scaffold only.** This repo is mid-rewrite from a Python CLI
-> (preserved in [`legacy/`](./legacy)) to a Tauri 2.x desktop app. The UI
-> currently shows a placeholder; download functionality is being added in
-> tracked plans under `docs/superpowers/plans/`.
+> **Status: Plan C complete (UI + mock backend).** This repo is mid-rewrite
+> from a Python CLI (preserved in [`legacy/`](./legacy)) to a Tauri 2.x
+> desktop app. The UI is fully functional but driven by a mock backend —
+> tile downloads are simulated. Plans A/B will replace the mock with real
+> downloads. See `docs/superpowers/plans/`.
 
 ## Develop
 
