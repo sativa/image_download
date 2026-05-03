@@ -1,14 +1,44 @@
 <script lang="ts">
-  import { input } from "../lib/state.svelte";
+  import { input, estimate } from "../lib/state.svelte";
   import { validateBbox, validateZoom } from "../lib/validate";
   import type { Source } from "../lib/types";
   import { save } from "@tauri-apps/plugin-dialog";
+  import { estimateOutput } from "../lib/ipc";
+  import { formatNumber, formatDuration } from "../lib/format";
 
   type Mode = "numeric" | "draw" | "import";
   let mode = $state<Mode>("numeric");
 
   let bboxErr = $derived(validateBbox(input.bbox));
   let zoomErr = $derived(validateZoom(input.zoom));
+
+  let debounceTimer: number | null = null;
+  $effect(() => {
+    // Re-runs whenever bbox/zoom/source mutate.
+    const b = [...input.bbox];
+    const z = input.zoom;
+    const s = input.source;
+
+    if (bboxErr || zoomErr) {
+      estimate.data = null;
+      estimate.loading = false;
+      estimate.error = null;
+      return;
+    }
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+    estimate.loading = true;
+    debounceTimer = setTimeout(async () => {
+      try {
+        estimate.data = await estimateOutput(b as [number, number, number, number], z, s);
+        estimate.error = null;
+      } catch (e) {
+        estimate.error = String(e);
+      } finally {
+        estimate.loading = false;
+      }
+    }, 200) as unknown as number;
+  });
 
   const sources: Source[] = ["esri", "google", "auto"];
 
@@ -75,6 +105,20 @@
       <button onclick={pickOutput}>Pick…</button>
     </div>
   </label>
+
+  <hr />
+  <div class="estimate">
+    {#if estimate.loading}
+      <em class="muted">computing estimate…</em>
+    {:else if estimate.error}
+      <em class="err">{estimate.error}</em>
+    {:else if estimate.data}
+      <div>{formatNumber(estimate.data.tile_count)} tiles · {estimate.data.pixel_w} × {estimate.data.pixel_h} px</div>
+      <div>≈ {estimate.data.est_size_mb.toFixed(1)} MB · {formatDuration(estimate.data.est_seconds)}</div>
+    {:else}
+      <em class="muted">enter a valid bbox to see estimate</em>
+    {/if}
+  </div>
 </section>
 
 <style>
@@ -94,4 +138,10 @@
   hr { border: none; border-top: 1px solid var(--border); margin: 0.3rem 0; }
   .row { display: flex; gap: 0.3rem; }
   .row input { flex: 1; }
+  .estimate {
+    background: var(--bg-elev);
+    padding: 0.5rem 0.7rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+  }
 </style>
