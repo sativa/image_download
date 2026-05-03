@@ -264,8 +264,15 @@ pub async fn start_download(
 }
 
 #[tauri::command]
-pub async fn cancel_download() -> Result<serde_json::Value, String> {
-    Err("not implemented yet (Task 7.3)".into())
+pub fn cancel_download(
+    runner: State<'_, Runner>,
+    download_id: String,
+) -> Result<serde_json::Value, String> {
+    let cancelled = runner.cancel(&download_id);
+    if !cancelled {
+        return Err(format!("unknown download_id: {}", download_id));
+    }
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 #[tauri::command]
