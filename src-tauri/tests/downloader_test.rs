@@ -111,3 +111,19 @@ async fn download_all_respects_cancellation() {
     assert!(result.iter().all(|t| t.bytes.is_none()));
     assert_eq!(progress.lock().unwrap().len(), 5);
 }
+
+use imagery_downloader_lib::core::downloader::TileCache;
+
+#[tokio::test]
+async fn tile_cache_missing_subset() {
+    let cache = TileCache::new();
+    let all = vec![
+        TileCoord { x: 0, y: 0, z: 5 },
+        TileCoord { x: 1, y: 0, z: 5 },
+        TileCoord { x: 2, y: 0, z: 5 },
+    ];
+    cache.put(all[0], bytes::Bytes::from_static(&[1])).await;
+    cache.put(all[2], bytes::Bytes::from_static(&[3])).await;
+    let missing = cache.missing(&all).await;
+    assert_eq!(missing, vec![all[1]]);
+}

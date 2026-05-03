@@ -121,3 +121,31 @@ where
     let _ = driver.await;
     out
 }
+
+use std::collections::HashMap;
+use tokio::sync::Mutex as TokioMutex;
+
+/// Session-scoped cache. Successful downloads stay; retry_failed only fetches missing.
+pub struct TileCache {
+    inner: TokioMutex<HashMap<TileCoord, Bytes>>,
+}
+
+impl Default for TileCache {
+    fn default() -> Self { Self::new() }
+}
+
+impl TileCache {
+    pub fn new() -> Self {
+        Self { inner: TokioMutex::new(HashMap::new()) }
+    }
+    pub async fn put(&self, c: TileCoord, b: Bytes) {
+        self.inner.lock().await.insert(c, b);
+    }
+    pub async fn get(&self, c: TileCoord) -> Option<Bytes> {
+        self.inner.lock().await.get(&c).cloned()
+    }
+    pub async fn missing(&self, all: &[TileCoord]) -> Vec<TileCoord> {
+        let g = self.inner.lock().await;
+        all.iter().filter(|c| !g.contains_key(c)).copied().collect()
+    }
+}
