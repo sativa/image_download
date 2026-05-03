@@ -42,3 +42,82 @@ pub async fn download_one(url: &str, cfg: &DownloadConfig) -> Result<Bytes, Down
     }
     Err(DownloadError::Exhausted(cfg.max_retries, last_status))
 }
+
+use crate::core::sources::{url_for_tile, SourceKind};
+use crate::core::tiles::TileCoord;
+use futures::stream::{self, StreamExt};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone)]
+pub struct DownloadedTile {
+    pub coord: TileCoord,
+    pub bytes: Option<Bytes>, // None if all retries failed
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    pub completed: u32,
+    pub total: u32,
+    pub bytes_downloaded: u64,
+    pub last_failed: Option<TileCoord>,
+}
+
+pub async fn download_all<F>(
+    coords: Vec<TileCoord>,
+    source: SourceKind,
+    cfg: DownloadConfig,
+    max_concurrency: usize,
+    cancel: CancellationToken,
+    mut on_progress: F,
+) -> Vec<DownloadedTile>
+where
+    F: FnMut(ProgressUpdate) + Send + 'static,
+{
+    let total = coords.len() as u32;
+    let cfg = Arc::new(cfg);
+    let completed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let bytes_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadedTile>(max_concurrency * 2);
+
+    let cancel_inner = cancel.clone();
+    let cfg_inner = cfg.clone();
+    let driver = tokio::spawn(async move {
+        stream::iter(coords)
+            .for_each_concurrent(max_concurrency, |c| {
+                let tx = tx.clone();
+                let cfg = cfg_inner.clone();
+                let cancel = cancel_inner.clone();
+                async move {
+                    if cancel.is_cancelled() {
+                        let _ = tx.send(DownloadedTile { coord: c, bytes: None }).await;
+                        return;
+                    }
+                    let url = url_for_tile(source, c);
+                    let bytes = tokio::select! {
+                        r = download_one(&url, &cfg) => r.ok(),
+                        _ = cancel.cancelled() => None,
+                    };
+                    let _ = tx.send(DownloadedTile { coord: c, bytes }).await;
+                }
+            })
+            .await;
+    });
+
+    let mut out = Vec::with_capacity(total as usize);
+    while let Some(tile) = rx.recv().await {
+        let nb = tile.bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+        let new_bytes = bytes_total.fetch_add(nb, std::sync::atomic::Ordering::Relaxed) + nb;
+        let new_completed = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let last_failed = if tile.bytes.is_none() { Some(tile.coord) } else { None };
+        on_progress(ProgressUpdate {
+            completed: new_completed,
+            total,
+            bytes_downloaded: new_bytes,
+            last_failed,
+        });
+        out.push(tile);
+    }
+    let _ = driver.await;
+    out
+}

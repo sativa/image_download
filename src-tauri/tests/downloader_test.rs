@@ -59,3 +59,30 @@ async fn download_one_gives_up_after_max_retries() {
     let err = download_one(&url, &config()).await.unwrap_err();
     assert!(err.to_string().contains("503") || err.to_string().contains("retries"));
 }
+
+use imagery_downloader_lib::core::downloader::{download_all, DownloadedTile, ProgressUpdate};
+use imagery_downloader_lib::core::sources::SourceKind;
+use imagery_downloader_lib::core::tiles::TileCoord;
+use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
+
+#[tokio::test]
+async fn download_all_empty_returns_empty() {
+    let progress: Arc<Mutex<Vec<ProgressUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let p2 = progress.clone();
+    let cfg = imagery_downloader_lib::core::downloader::DownloadConfig {
+        max_retries: 0,
+        backoff_base: std::time::Duration::ZERO,
+        timeout_per_request: std::time::Duration::from_secs(1),
+    };
+    let result = download_all(
+        vec![],
+        SourceKind::Esri,
+        cfg,
+        4,
+        CancellationToken::new(),
+        move |p| p2.lock().unwrap().push(p),
+    ).await;
+    assert!(result.is_empty());
+    assert!(progress.lock().unwrap().is_empty());
+}
