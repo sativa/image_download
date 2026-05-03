@@ -14,7 +14,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "types": ["vite/client", "vitest/globals"]
+    "types": ["vite/client", "vitest/globals", "geojson"]
   },
   "include": ["src/**/*.ts", "src/**/*.svelte", "vitest.config.ts"]
 }
