@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint .github/workflows/*.yml
+else
+  echo "warn: actionlint not installed; skipping workflow lint" >&2
+fi
