@@ -131,6 +131,17 @@
     const src = map.getSource("base") as maplibregl.RasterTileSource | undefined;
     if (src) src.setTiles([url]);
   });
+
+  $effect(() => {
+    if (!map) return;
+    const [w, s, e, n] = input.bbox;
+    if (![w, s, e, n].every(Number.isFinite)) return;
+    // Avoid jitter: only fit if currently outside view
+    const cur = map.getBounds();
+    if (cur.contains([w, s]) && cur.contains([e, n])) return;
+    map.fitBounds([[w, s], [e, n]], { padding: 40, animate: false });
+    persistBboxLayer(new maplibregl.LngLatBounds([w, s], [e, n]));
+  });
 </script>
 
 <div class="wrap">
