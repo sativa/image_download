@@ -30,6 +30,13 @@
   });
 
   onDestroy(() => map?.remove());
+
+  $effect(() => {
+    if (!map) return;
+    const url = previewTileUrl(input.source);
+    const src = map.getSource("base") as maplibregl.RasterTileSource | undefined;
+    if (src) src.setTiles([url]);
+  });
 </script>
 
 <div class="wrap" bind:this={container}></div>
