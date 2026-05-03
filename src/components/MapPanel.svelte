@@ -8,6 +8,79 @@
   let container: HTMLDivElement;
   let map: maplibregl.Map | null = null;
 
+  let drawing = $state(false);
+  let drawStart: maplibregl.LngLat | null = null;
+  let drawRect: maplibregl.LngLatBounds | null = null;
+
+  function bboxRing(b: maplibregl.LngLatBounds): GeoJSON.Feature<GeoJSON.Polygon> {
+    const w = b.getWest(), s = b.getSouth(), e = b.getEast(), n = b.getNorth();
+    return {
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "Polygon",
+        coordinates: [[[w, s], [e, s], [e, n], [w, n], [w, s]]],
+      },
+    };
+  }
+
+  function drawPreviewLayer() {
+    if (!map || !drawRect) return;
+    const ring = bboxRing(drawRect);
+    if (map.getSource("draw-preview")) {
+      (map.getSource("draw-preview") as maplibregl.GeoJSONSource).setData(ring);
+    } else {
+      map.addSource("draw-preview", { type: "geojson", data: ring });
+      map.addLayer({
+        id: "draw-preview",
+        type: "line",
+        source: "draw-preview",
+        paint: { "line-color": "#0066cc", "line-width": 2, "line-dasharray": [2, 2] },
+      });
+    }
+  }
+
+  function persistBboxLayer(b: maplibregl.LngLatBounds) {
+    if (!map) return;
+    const ring = bboxRing(b);
+    if (map.getLayer("draw-preview")) map.removeLayer("draw-preview");
+    if (map.getSource("draw-preview")) map.removeSource("draw-preview");
+    if (map.getSource("bbox")) {
+      (map.getSource("bbox") as maplibregl.GeoJSONSource).setData(ring);
+    } else {
+      map.addSource("bbox", { type: "geojson", data: ring });
+      map.addLayer({
+        id: "bbox-fill",
+        type: "fill",
+        source: "bbox",
+        paint: { "fill-color": "#0066cc", "fill-opacity": 0.15 },
+      });
+      map.addLayer({
+        id: "bbox-line",
+        type: "line",
+        source: "bbox",
+        paint: { "line-color": "#0066cc", "line-width": 2 },
+      });
+    }
+  }
+
+  function enableDraw() {
+    if (!map) return;
+    drawing = true;
+    map.getCanvas().style.cursor = "crosshair";
+    map.dragPan.disable();
+  }
+
+  function disableDraw() {
+    drawing = false;
+    if (map) {
+      map.getCanvas().style.cursor = "";
+      map.dragPan.enable();
+    }
+    drawStart = null;
+    drawRect = null;
+  }
+
   onMount(() => {
     map = new maplibregl.Map({
       container,
@@ -27,6 +100,27 @@
       center: [(input.bbox[0] + input.bbox[2]) / 2, (input.bbox[1] + input.bbox[3]) / 2],
       zoom: 4,
     });
+
+    map.on("mousedown", (e) => {
+      if (!drawing) return;
+      drawStart = e.lngLat;
+      e.preventDefault();
+    });
+    map.on("mousemove", (e) => {
+      if (!drawing || !drawStart) return;
+      drawRect = new maplibregl.LngLatBounds(drawStart, e.lngLat);
+      drawPreviewLayer();
+    });
+    map.on("mouseup", (e) => {
+      if (!drawing || !drawStart) return;
+      const bounds = new maplibregl.LngLatBounds(drawStart, e.lngLat);
+      input.bbox = [
+        bounds.getWest(), bounds.getSouth(),
+        bounds.getEast(), bounds.getNorth(),
+      ];
+      disableDraw();
+      persistBboxLayer(bounds);
+    });
   });
 
   onDestroy(() => map?.remove());
@@ -39,9 +133,25 @@
   });
 </script>
 
-<div class="wrap" bind:this={container}></div>
+<div class="wrap">
+  <div class="map" bind:this={container}></div>
+  <div class="controls">
+    {#if drawing}
+      <button onclick={disableDraw}>Cancel draw</button>
+    {:else}
+      <button onclick={enableDraw}>Draw rectangle</button>
+    {/if}
+  </div>
+</div>
 
 <style>
-  .wrap { width: 100%; height: 100%; }
+  .wrap { position: relative; width: 100%; height: 100%; }
+  .map { width: 100%; height: 100%; }
   :global(.maplibregl-canvas) { outline: none; }
+  .controls {
+    position: absolute;
+    top: 1rem;
+    left: 1rem;
+    z-index: 10;
+  }
 </style>
