@@ -23,6 +23,7 @@ tokio-util = { version = "0.7.18", features = ["rt"] }
 uuid = { version = "1.20.0", features = ["v4"] }
 directories = "6.0.0"
 tauri-plugin-fs = "2"
+tauri-plugin-dialog = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

@@ -2,6 +2,7 @@
   import { input } from "../lib/state.svelte";
   import { validateBbox, validateZoom } from "../lib/validate";
   import type { Source } from "../lib/types";
+  import { save } from "@tauri-apps/plugin-dialog";
 
   type Mode = "numeric" | "draw" | "import";
   let mode = $state<Mode>("numeric");
@@ -10,6 +11,15 @@
   let zoomErr = $derived(validateZoom(input.zoom));
 
   const sources: Source[] = ["esri", "google", "auto"];
+
+  async function pickOutput() {
+    const p = await save({
+      title: "Save GeoTIFF as…",
+      defaultPath: "imagery.tif",
+      filters: [{ name: "GeoTIFF", extensions: ["tif"] }],
+    });
+    if (p) input.outputPath = p;
+  }
 </script>
 
 <section class="panel">
@@ -58,6 +68,13 @@
       {#each sources as s}<option value={s}>{s}</option>{/each}
     </select>
   </label>
+
+  <label>Output
+    <div class="row">
+      <input type="text" placeholder="… select a .tif path" readonly value={input.outputPath} />
+      <button onclick={pickOutput}>Pick…</button>
+    </div>
+  </label>
 </section>
 
 <style>
@@ -75,4 +92,6 @@
   .err { color: var(--error); font-size: 0.8rem; margin: 0; }
   .muted { color: var(--fg-muted); font-size: 0.9rem; }
   hr { border: none; border-top: 1px solid var(--border); margin: 0.3rem 0; }
+  .row { display: flex; gap: 0.3rem; }
+  .row input { flex: 1; }
 </style>
