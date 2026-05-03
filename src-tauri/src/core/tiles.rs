@@ -16,6 +16,17 @@ pub fn lat_to_tile_y(lat: f64, zoom: u32) -> i64 {
     ((1.0 - (lat_rad.tan() + 1.0 / lat_rad.cos()).ln() / PI) / 2.0 * n).floor() as i64
 }
 
+pub fn tile_x_to_lon(x: i64, zoom: u32) -> f64 {
+    let n = 2_f64.powi(zoom as i32);
+    x as f64 / n * 360.0 - 180.0
+}
+
+pub fn tile_y_to_lat(y: i64, zoom: u32) -> f64 {
+    let n = 2_f64.powi(zoom as i32);
+    let lat_rad = (PI * (1.0 - 2.0 * y as f64 / n)).sinh().atan();
+    lat_rad.to_degrees()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +70,32 @@ mod tests {
         // (Spec value 388 was the off-by-one this test was meant to catch.)
         assert_eq!(lon_to_tile_x(116.404, 10), 843);
         assert_eq!(lat_to_tile_y(39.915, 10), 387);
+    }
+
+    #[test]
+    fn roundtrip_lon() {
+        for &lon in &[-180.0, -90.0, 0.0, 90.0, 179.999] {
+            let x = lon_to_tile_x(lon, 8);
+            let back = tile_x_to_lon(x, 8);
+            assert!(back <= lon, "lon={} → x={} → back={}", lon, x, back);
+            assert!(back >= lon - 360.0 / 256.0, "tile too far west");
+        }
+    }
+
+    #[test]
+    fn roundtrip_lat() {
+        for &lat in &[-80.0, -45.0, 0.0, 45.0, 80.0] {
+            let y = lat_to_tile_y(lat, 8);
+            let back = tile_y_to_lat(y, 8);
+            assert!(back >= lat - 1.0, "lat={} → y={} → back={}", lat, y, back);
+        }
+    }
+
+    #[test]
+    fn bbox_corners_at_zoom_4_china() {
+        let west = tile_x_to_lon(12, 4);
+        let north = tile_y_to_lat(6, 4);
+        assert!((west - 90.0).abs() < 0.001);
+        assert!((north - 40.97).abs() < 0.1);
     }
 }
