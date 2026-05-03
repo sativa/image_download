@@ -52,6 +52,22 @@ pub async fn probe_url(url: &str) -> Result<Duration, reqwest::Error> {
     Ok(start.elapsed())
 }
 
+/// Probe both Esri and Google and return the faster one. The sample tile is small
+/// (continent-scale, z=2) so probes finish in ~100 ms each.
+pub async fn pick_auto() -> SourceKind {
+    let sample = TileCoord { x: 0, y: 0, z: 2 };
+    let esri_url = url_for_tile(SourceKind::Esri, sample);
+    let google_url = url_for_tile(SourceKind::Google, sample);
+    let (esri, google) = tokio::join!(probe_url(&esri_url), probe_url(&google_url));
+    match (esri, google) {
+        (Ok(e), Ok(g)) if e <= g => SourceKind::Esri,
+        (Ok(_), Ok(_)) => SourceKind::Google,
+        (Ok(_), Err(_)) => SourceKind::Esri,
+        (Err(_), Ok(_)) => SourceKind::Google,
+        (Err(_), Err(_)) => SourceKind::Esri, // fallback
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +91,12 @@ mod tests {
             assert_eq!(SourceKind::parse(s.as_str()), Some(s));
         }
         assert_eq!(SourceKind::parse("bing"), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "real network"]
+    async fn pick_auto_returns_some_source() {
+        let pick = pick_auto().await;
+        assert!(pick == SourceKind::Esri || pick == SourceKind::Google);
     }
 }
