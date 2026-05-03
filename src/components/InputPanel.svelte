@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { input, estimate } from "../lib/state.svelte";
+  import { input, estimate, download, pushToast } from "../lib/state.svelte";
   import { validateBbox, validateZoom } from "../lib/validate";
   import type { Source } from "../lib/types";
   import { save } from "@tauri-apps/plugin-dialog";
-  import { estimateOutput } from "../lib/ipc";
+  import { estimateOutput, startDownload } from "../lib/ipc";
   import { formatNumber, formatDuration } from "../lib/format";
 
   type Mode = "numeric" | "draw" | "import";
@@ -41,6 +41,32 @@
   });
 
   const sources: Source[] = ["esri", "google", "auto"];
+
+  let canStart = $derived(
+    !bboxErr && !zoomErr && input.outputPath.length > 0 && download.id === null,
+  );
+
+  async function start() {
+    try {
+      download.finished = false;
+      download.error = null;
+      download.progress = null;
+      download.failedTiles = 0;
+      download.stage = null;
+      const r = await startDownload({
+        bbox: input.bbox,
+        zoom: input.zoom,
+        source: input.source,
+        output_path: input.outputPath,
+        max_concurrency: input.maxConcurrency,
+        retry_per_tile: input.retryPerTile,
+        write_preview_png: input.writePreviewPng,
+      });
+      download.id = r.download_id;
+    } catch (e) {
+      pushToast("error", String(e));
+    }
+  }
 
   async function pickOutput() {
     const p = await save({
@@ -119,6 +145,10 @@
       <em class="muted">enter a valid bbox to see estimate</em>
     {/if}
   </div>
+
+  <button class="primary" disabled={!canStart} onclick={start}>
+    {download.id ? "Downloading…" : "Start download"}
+  </button>
 </section>
 
 <style>
@@ -143,5 +173,12 @@
     padding: 0.5rem 0.7rem;
     border-radius: 6px;
     font-size: 0.85rem;
+  }
+  .primary {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+    padding: 0.6rem;
+    font-weight: 600;
   }
 </style>
