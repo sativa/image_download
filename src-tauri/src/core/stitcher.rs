@@ -54,4 +54,27 @@ mod tests {
         assert_eq!(img.get_pixel(128, 128), &image::Rgba([255, 0, 0, 255]));
         assert_eq!(img.get_pixel(384, 128), &image::Rgba([255, 0, 0, 255]));
     }
+
+    #[test]
+    fn missing_tile_leaves_transparent_region() {
+        let range = TileRange { x_min: 0, y_min: 0, x_max: 1, y_max: 0, z: 5 };
+        let tiles = vec![
+            DownloadedTile { coord: TileCoord { x: 0, y: 0, z: 5 }, bytes: Some(red_png_tile()) },
+            DownloadedTile { coord: TileCoord { x: 1, y: 0, z: 5 }, bytes: None },
+        ];
+        let img = stitch_rgba(&tiles, range);
+        assert_eq!(img.get_pixel(128, 128).0[3], 255, "tile 0 should be opaque");
+        assert_eq!(img.get_pixel(384, 128).0[3], 0, "tile 1 should be transparent (failed)");
+    }
+
+    #[test]
+    fn corrupt_bytes_treated_as_failed() {
+        let range = TileRange { x_min: 0, y_min: 0, x_max: 0, y_max: 0, z: 5 };
+        let tiles = vec![DownloadedTile {
+            coord: TileCoord { x: 0, y: 0, z: 5 },
+            bytes: Some(bytes::Bytes::from_static(b"not an image")),
+        }];
+        let img = stitch_rgba(&tiles, range);
+        assert_eq!(img.get_pixel(0, 0).0[3], 0);
+    }
 }
