@@ -2,8 +2,8 @@
   import { input, estimate, download, pushToast } from "../lib/state.svelte";
   import { validateBbox, validateZoom } from "../lib/validate";
   import type { Source } from "../lib/types";
-  import { save } from "@tauri-apps/plugin-dialog";
-  import { estimateOutput, startDownload } from "../lib/ipc";
+  import { save, open } from "@tauri-apps/plugin-dialog";
+  import { estimateOutput, startDownload, parseVectorFile } from "../lib/ipc";
   import { formatNumber, formatDuration } from "../lib/format";
 
   type Mode = "numeric" | "draw" | "import";
@@ -68,6 +68,23 @@
     }
   }
 
+  async function pickVector() {
+    const p = await open({
+      title: "Select vector file",
+      filters: [
+        { name: "Vector", extensions: ["geojson", "shp", "gpkg"] },
+      ],
+    });
+    if (!p || Array.isArray(p)) return;
+    try {
+      const r = await parseVectorFile(p);
+      input.bbox = r.bbox;
+      pushToast("info", `Loaded ${r.layer_count} layer(s) from ${p}`);
+    } catch (e) {
+      pushToast("warn", `Vector parsing pending Plan A — ${String(e)}`);
+    }
+  }
+
   async function pickOutput() {
     const p = await save({
       title: "Save GeoTIFF as…",
@@ -108,8 +125,9 @@
   {:else if mode === "draw"}
     <p class="muted">Draw a rectangle on the map. Coordinates appear here once you release.</p>
   {:else}
-    <p class="muted">Drag a .geojson / .shp / .gpkg into the map area, or use the picker:</p>
-    <button disabled>Choose file… (Plan A)</button>
+    <p class="muted">Pick a .geojson, .shp or .gpkg file:</p>
+    <button onclick={pickVector}>Choose file…</button>
+    <p class="muted small">Parsing is implemented by Plan A; picker will wire through then.</p>
   {/if}
 
   <hr />
@@ -181,4 +199,5 @@
     padding: 0.6rem;
     font-weight: 600;
   }
+  .small { font-size: 0.75rem; }
 </style>
