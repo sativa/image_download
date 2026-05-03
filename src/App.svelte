@@ -1,18 +1,42 @@
 <script lang="ts">
-  let pong = $state<string>("...");
-  async function ping() {
-    pong = "Tauri scaffold OK at " + new Date().toISOString();
-  }
+  import InputPanel from "./components/InputPanel.svelte";
+  import MapPanel from "./components/MapPanel.svelte";
+  import ProgressPanel from "./components/ProgressPanel.svelte";
+  import HistoryPanel from "./components/HistoryPanel.svelte";
+  import Toast from "./components/Toast.svelte";
 </script>
 
-<main>
-  <h1>Imagery Downloader</h1>
-  <p>Scaffold-only build. Plans A/B/C will replace this UI.</p>
-  <button onclick={ping}>Ping</button>
-  <p>{pong}</p>
+<main class="layout">
+  <aside class="left">
+    <InputPanel />
+  </aside>
+  <section class="center">
+    <MapPanel />
+  </section>
+  <aside class="right">
+    <ProgressPanel />
+    <HistoryPanel />
+  </aside>
 </main>
+<Toast />
 
 <style>
-  main { font-family: system-ui, sans-serif; padding: 2rem; }
-  button { padding: 0.5rem 1rem; }
+  .layout {
+    display: grid;
+    grid-template-columns: 320px 1fr 360px;
+    height: 100vh;
+    gap: 1px;
+    background: var(--border);
+  }
+  .left, .center, .right {
+    background: var(--bg);
+    overflow: auto;
+  }
+  .right {
+    display: flex;
+    flex-direction: column;
+  }
+  @media (max-width: 1100px) {
+    .layout { grid-template-columns: 280px 1fr 320px; }
+  }
 </style>
