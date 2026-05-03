@@ -39,6 +39,19 @@ pub fn url_for_tile(s: SourceKind, t: TileCoord) -> String {
     }
 }
 
+use std::time::{Duration, Instant};
+
+/// Issue a GET to the URL, return wall-clock time. Errors on non-2xx or network failure.
+pub async fn probe_url(url: &str) -> Result<Duration, reqwest::Error> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let start = Instant::now();
+    let resp = client.get(url).send().await?;
+    resp.error_for_status()?;
+    Ok(start.elapsed())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
