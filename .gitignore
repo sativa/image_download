@@ -15,6 +15,7 @@ venv/
 # Tauri (will be used after refactor)
 src-tauri/target/
 src-tauri/Cargo.lock
+src-tauri/gen/
 node_modules/
 dist/
 .svelte-kit/
