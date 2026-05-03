@@ -14,6 +14,8 @@ pub fn run() {
             mocks::commands::cancel_download,
             mocks::commands::retry_failed,
             mocks::commands::parse_vector_file,
+            mocks::history_commands::list_history,
+            mocks::history_commands::clear_history,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
