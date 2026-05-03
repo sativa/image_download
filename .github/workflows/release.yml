@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            args: "--target aarch64-apple-darwin"
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            args: "--target x86_64-apple-darwin"
+          - platform: windows-latest
+            target: ""
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        shell: bash
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          tag="${REF##*/}"
+          ver="${tag#v}"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Patch version into Cargo.toml
+        shell: bash
+        env:
+          NEW_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cd src-tauri
+          python3 - <<'PY'
+          import os, re
+          ver = os.environ["NEW_VERSION"]
+          p = "Cargo.toml"
+          s = open(p).read()
+          s = re.sub(r'^version\s*=.*$', f'version = "{ver}"', s, count=1, flags=re.M)
+          open(p, "w").write(s)
+          PY
+          grep '^version' Cargo.toml
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: release-${{ matrix.platform }}-${{ matrix.target }}
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          tagName: ${{ steps.ver.outputs.tag }}
+          releaseName: "Imagery Downloader ${{ steps.ver.outputs.tag }}"
+          releaseBody: |
+            See attached installers below.
+
+            - macOS Apple Silicon: `*_aarch64.dmg`
+            - macOS Intel: `*_x64.dmg`
+            - Windows: `*.msi` (recommended) or `*-setup.exe`
+          releaseDraft: true
+          prerelease: ${{ contains(steps.ver.outputs.tag, '-') }}
+          args: ${{ matrix.args }}
