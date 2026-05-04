@@ -1,4 +1,6 @@
-use crate::history::{Store, HistoryEntry, default_path};
+//! History persistence Tauri commands. Wraps `core::history::Store`.
+
+use crate::core::history::{default_path, HistoryEntry, Store};
 use std::sync::OnceLock;
 
 static STORE: OnceLock<Store> = OnceLock::new();

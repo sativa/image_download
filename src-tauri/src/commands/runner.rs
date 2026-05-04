@@ -1,5 +1,6 @@
-//! Async runner that drives mock progress events.
+//! CancellationToken registry shared between start_download and cancel_download.
 
+use crate::commands::download::StartDownloadArgs;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -7,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 #[derive(Default)]
 pub struct Runner {
     tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Stash of original args so retry_failed can re-run the same pipeline.
+    args: Mutex<HashMap<String, StartDownloadArgs>>,
 }
 
 impl Runner {
@@ -26,5 +29,12 @@ impl Runner {
     #[allow(dead_code)]
     pub fn forget(&self, id: &str) {
         self.tokens.lock().unwrap().remove(id);
+        self.args.lock().unwrap().remove(id);
+    }
+    pub fn stash_args(&self, id: String, args: StartDownloadArgs) {
+        self.args.lock().unwrap().insert(id, args);
+    }
+    pub fn lookup_args(&self, id: &str) -> Option<StartDownloadArgs> {
+        self.args.lock().unwrap().get(id).cloned()
     }
 }

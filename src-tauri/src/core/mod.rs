@@ -9,3 +9,4 @@ pub mod downloader;
 pub mod stitcher;
 pub mod cog;
 pub mod vector;
+pub mod history;

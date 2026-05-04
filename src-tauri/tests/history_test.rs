@@ -1,4 +1,4 @@
-use imagery_downloader_lib::history::{Store, HistoryEntry};
+use imagery_downloader_lib::core::history::{Store, HistoryEntry};
 use std::path::PathBuf;
 
 fn tmp_path() -> PathBuf {
