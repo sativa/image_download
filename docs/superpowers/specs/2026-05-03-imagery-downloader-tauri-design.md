@@ -322,3 +322,30 @@ Pending follow-ups (documented in `core/README.md`):
 
 Plan B can now wire these into Tauri commands by deleting `mocks/` and
 adding `commands/` per the contract in `core/README.md`.
+
+---
+
+## Plan B Implementation Status (2026-05-04)
+
+✅ `src-tauri/src/history.rs` moved into `src-tauri/src/core/history.rs` (no API change).
+✅ `src-tauri/src/commands/` created with 4 modules (mod / runner / history / vector / download).
+✅ `commands/download.rs` runs the real pipeline: range_for_bbox → download_all → stitch_rgba → write_cog → write_preview_png → record HistoryEntry.
+✅ Progress events throttled to ~4 Hz (250 ms interval) per spec §3.2.
+✅ Tile-failed events emitted on each exhausted retry.
+✅ Cancellation respected (CancellationToken in Runner, propagated to download_all).
+✅ retry_failed re-runs full pipeline (args stashed by start_download); tile-cache reuse is a follow-up.
+✅ `src-tauri/src/mocks/` deleted entirely.
+✅ Frontend (src/lib/ipc.ts + types.ts) unchanged — IPC contract preserved.
+✅ All 41 Rust tests still green; 16 frontend tests still green.
+
+Remaining follow-ups carried over from Plan A:
+- COG deflate compression (tiff@0.10 typed-encoder API limitation).
+- COG overview pyramid (tiff@0.10 single-IFD limitation).
+- WKB types beyond POLYGON in vector.
+- Multi-layer GPKG.
+- Shapefile generative test fixture.
+
+New Plan B follow-ups:
+- retry_failed tile-cache reuse (only refetch missing — currently full re-run).
+- Live UI test against `pnpm tauri dev` to verify event throttling under real network.
+- `auto` source actually probes both providers (currently falls back to Esri).
