@@ -118,6 +118,15 @@
       zoom: 4,
     });
 
+    // Normalize two LngLat points into proper (sw, ne) regardless of drag direction.
+    // MapLibre's LngLatBounds constructor doesn't auto-normalize — passing (NE, SW)
+    // gives you a bbox with min > max coordinates and breaks downstream validation.
+    const normalize = (a: maplibregl.LngLat, b: maplibregl.LngLat) => {
+      const sw = new maplibregl.LngLat(Math.min(a.lng, b.lng), Math.min(a.lat, b.lat));
+      const ne = new maplibregl.LngLat(Math.max(a.lng, b.lng), Math.max(a.lat, b.lat));
+      return new maplibregl.LngLatBounds(sw, ne);
+    };
+
     map.on("mousedown", (e) => {
       if (!drawing) return;
       drawStart = e.lngLat;
@@ -125,12 +134,12 @@
     });
     map.on("mousemove", (e) => {
       if (!drawing || !drawStart) return;
-      drawRect = new maplibregl.LngLatBounds(drawStart, e.lngLat);
+      drawRect = normalize(drawStart, e.lngLat);
       drawPreviewLayer();
     });
     map.on("mouseup", (e) => {
       if (!drawing || !drawStart) return;
-      const bounds = new maplibregl.LngLatBounds(drawStart, e.lngLat);
+      const bounds = normalize(drawStart, e.lngLat);
       input.bbox = [
         bounds.getWest(), bounds.getSouth(),
         bounds.getEast(), bounds.getNorth(),
