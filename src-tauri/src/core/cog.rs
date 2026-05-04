@@ -56,9 +56,8 @@ pub fn write_cog(img: &RgbaImage, p: &CogParams, path: &Path) -> Result<()> {
         // Header (4 u16): KeyDirectoryVersion=1, KeyRevision=1, MinorRevision=1, NumberOfKeys=3.
         // Then 3 quadruples (KeyID, TIFFTagLocation=0, Count=1, Value).
         let geokeys: [u16; 4 + 4 * 3] = [
-            1, 1, 1, 3,
-            1024, 0, 1, 1,    // GTModelTypeGeoKey = ModelTypeProjected
-            1025, 0, 1, 1,    // GTRasterTypeGeoKey = RasterPixelIsArea
+            1, 1, 1, 3, 1024, 0, 1, 1, // GTModelTypeGeoKey = ModelTypeProjected
+            1025, 0, 1, 1, // GTRasterTypeGeoKey = RasterPixelIsArea
             3072, 0, 1, 3857, // ProjectedCSTypeGeoKey = EPSG:3857
         ];
         tiff_img
@@ -110,11 +109,16 @@ mod tests {
 
     #[test]
     fn world_at_zoom_zero() {
-        let bb = bbox_3857_from_range(TileRange { x_min: 0, y_min: 0, x_max: 0, y_max: 0, z: 0 });
+        let bb = bbox_3857_from_range(TileRange {
+            x_min: 0,
+            y_min: 0,
+            x_max: 0,
+            y_max: 0,
+            z: 0,
+        });
         assert!((bb[0] + EARTH_HALF_CIRC_M).abs() < 1.0);
         assert!((bb[2] - EARTH_HALF_CIRC_M).abs() < 1.0);
         assert!((bb[3] - EARTH_HALF_CIRC_M).abs() < 1.0);
         assert!((bb[1] + EARTH_HALF_CIRC_M).abs() < 1.0);
     }
 }
-

@@ -49,9 +49,8 @@ impl TileRange {
     }
     pub fn iter(&self) -> impl Iterator<Item = TileCoord> + '_ {
         let z = self.z;
-        (self.y_min..=self.y_max).flat_map(move |y| {
-            (self.x_min..=self.x_max).map(move |x| TileCoord { x, y, z })
-        })
+        (self.y_min..=self.y_max)
+            .flat_map(move |y| (self.x_min..=self.x_max).map(move |x| TileCoord { x, y, z }))
     }
 }
 
@@ -106,7 +105,11 @@ mod tests {
         let north = lat_to_tile_y(89.0, 4);
         let south = lat_to_tile_y(-89.0, 4);
         assert!(north <= 0, "north tile should clamp at top: got {}", north);
-        assert!(south >= 15, "south tile should clamp at bottom: got {}", south);
+        assert!(
+            south >= 15,
+            "south tile should clamp at bottom: got {}",
+            south
+        );
     }
 
     #[test]

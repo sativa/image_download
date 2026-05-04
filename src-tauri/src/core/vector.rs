@@ -40,7 +40,11 @@ fn parse_geojson(path: &Path) -> Result<ParsedVector> {
         geojson::GeoJson::Geometry(g) => (g, 1),
     };
     let bbox = geometry_bbox(&geom)?;
-    Ok(ParsedVector { bbox, geometry: geom, layer_count: count })
+    Ok(ParsedVector {
+        bbox,
+        geometry: geom,
+        layer_count: count,
+    })
 }
 
 fn geometry_bbox(g: &geojson::Geometry) -> Result<[f64; 4]> {
@@ -48,21 +52,41 @@ fn geometry_bbox(g: &geojson::Geometry) -> Result<[f64; 4]> {
     let mut min = [f64::INFINITY; 2];
     let mut max = [f64::NEG_INFINITY; 2];
     let mut feed = |x: f64, y: f64| {
-        if x < min[0] { min[0] = x }
-        if y < min[1] { min[1] = y }
-        if x > max[0] { max[0] = x }
-        if y > max[1] { max[1] = y }
+        if x < min[0] {
+            min[0] = x
+        }
+        if y < min[1] {
+            min[1] = y
+        }
+        if x > max[0] {
+            max[0] = x
+        }
+        if y > max[1] {
+            max[1] = y
+        }
     };
     match &g.value {
         Value::Point(c) => feed(c[0], c[1]),
         Value::LineString(cs) | Value::MultiPoint(cs) => {
-            for c in cs { feed(c[0], c[1]) }
+            for c in cs {
+                feed(c[0], c[1])
+            }
         }
         Value::Polygon(rings) | Value::MultiLineString(rings) => {
-            for ring in rings { for c in ring { feed(c[0], c[1]) } }
+            for ring in rings {
+                for c in ring {
+                    feed(c[0], c[1])
+                }
+            }
         }
         Value::MultiPolygon(polys) => {
-            for poly in polys { for ring in poly { for c in ring { feed(c[0], c[1]) } } }
+            for poly in polys {
+                for ring in poly {
+                    for c in ring {
+                        feed(c[0], c[1])
+                    }
+                }
+            }
         }
         Value::GeometryCollection(gs) => {
             for sub in gs {
@@ -91,10 +115,18 @@ fn parse_shapefile(path: &Path) -> Result<ParsedVector> {
         match &shape {
             shapefile::Shape::Polygon(p) => {
                 let bb = p.bbox();
-                if bb.min.x < min[0] { min[0] = bb.min.x }
-                if bb.min.y < min[1] { min[1] = bb.min.y }
-                if bb.max.x > max[0] { max[0] = bb.max.x }
-                if bb.max.y > max[1] { max[1] = bb.max.y }
+                if bb.min.x < min[0] {
+                    min[0] = bb.min.x
+                }
+                if bb.min.y < min[1] {
+                    min[1] = bb.min.y
+                }
+                if bb.max.x > max[0] {
+                    max[0] = bb.max.x
+                }
+                if bb.max.y > max[1] {
+                    max[1] = bb.max.y
+                }
                 if first_geom.is_none() {
                     let rings: Vec<Vec<Vec<f64>>> = p
                         .rings()
@@ -105,13 +137,22 @@ fn parse_shapefile(path: &Path) -> Result<ParsedVector> {
                 }
             }
             shapefile::Shape::Point(p) => {
-                if p.x < min[0] { min[0] = p.x }
-                if p.y < min[1] { min[1] = p.y }
-                if p.x > max[0] { max[0] = p.x }
-                if p.y > max[1] { max[1] = p.y }
+                if p.x < min[0] {
+                    min[0] = p.x
+                }
+                if p.y < min[1] {
+                    min[1] = p.y
+                }
+                if p.x > max[0] {
+                    max[0] = p.x
+                }
+                if p.y > max[1] {
+                    max[1] = p.y
+                }
                 if first_geom.is_none() {
-                    first_geom =
-                        Some(geojson::Geometry::new(geojson::Value::Point(vec![p.x, p.y])));
+                    first_geom = Some(geojson::Geometry::new(geojson::Value::Point(vec![
+                        p.x, p.y,
+                    ])));
                 }
             }
             _ => {}
@@ -130,7 +171,9 @@ fn parse_shapefile(path: &Path) -> Result<ParsedVector> {
 fn parse_gpkg(path: &Path) -> Result<ParsedVector> {
     let conn = rusqlite::Connection::open(path)?;
     let row_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM gpkg_geometry_columns", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM gpkg_geometry_columns", [], |row| {
+            row.get(0)
+        })
         .map_err(|_| anyhow!("no_geometry"))?;
     let table: String = conn
         .query_row(
@@ -166,7 +209,11 @@ fn parse_gpkg(path: &Path) -> Result<ParsedVector> {
     let wkb = &blob[header_len..];
     let geom = parse_wkb(wkb)?;
     let bbox = geometry_bbox(&geom)?;
-    Ok(ParsedVector { bbox, geometry: geom, layer_count: row_count as u32 })
+    Ok(ParsedVector {
+        bbox,
+        geometry: geom,
+        layer_count: row_count as u32,
+    })
 }
 
 fn parse_wkb(b: &[u8]) -> Result<geojson::Geometry> {
@@ -176,11 +223,19 @@ fn parse_wkb(b: &[u8]) -> Result<geojson::Geometry> {
     let little = b[0] == 1;
     let read_u32 = |i: usize| -> u32 {
         let arr: [u8; 4] = b[i..i + 4].try_into().unwrap();
-        if little { u32::from_le_bytes(arr) } else { u32::from_be_bytes(arr) }
+        if little {
+            u32::from_le_bytes(arr)
+        } else {
+            u32::from_be_bytes(arr)
+        }
     };
     let read_f64 = |i: usize| -> f64 {
         let arr: [u8; 8] = b[i..i + 8].try_into().unwrap();
-        if little { f64::from_le_bytes(arr) } else { f64::from_be_bytes(arr) }
+        if little {
+            f64::from_le_bytes(arr)
+        } else {
+            f64::from_be_bytes(arr)
+        }
     };
     let typ = read_u32(1);
     if typ != 3 {

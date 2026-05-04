@@ -155,7 +155,10 @@ async fn run_pipeline(
     let start = Instant::now();
     let _ = app.emit(
         "download://stage",
-        StageEvent { download_id: id.clone(), stage: "downloading".into() },
+        StageEvent {
+            download_id: id.clone(),
+            stage: "downloading".into(),
+        },
     );
 
     let range = range_for_bbox(args.bbox, args.zoom);
@@ -169,7 +172,9 @@ async fn run_pipeline(
     };
 
     // Throttle progress to ~4 Hz; spec §3.2.
-    let last_emit = Arc::new(std::sync::Mutex::new(Instant::now() - Duration::from_secs(1)));
+    let last_emit = Arc::new(std::sync::Mutex::new(
+        Instant::now() - Duration::from_secs(1),
+    ));
     let app_for_progress = app.clone();
     let id_for_progress = id.clone();
     let progress_cb = move |p: ProgressUpdate| {
@@ -227,7 +232,11 @@ async fn run_pipeline(
     if token.is_cancelled() {
         let _ = app.emit(
             "download://done",
-            DoneEvent::Err { download_id: id, ok: false, error: "cancelled".into() },
+            DoneEvent::Err {
+                download_id: id,
+                ok: false,
+                error: "cancelled".into(),
+            },
         );
         return;
     }
@@ -236,17 +245,30 @@ async fn run_pipeline(
 
     let _ = app.emit(
         "download://stage",
-        StageEvent { download_id: id.clone(), stage: "stitching".into() },
+        StageEvent {
+            download_id: id.clone(),
+            stage: "stitching".into(),
+        },
     );
     let img = stitch_rgba(&downloaded, range);
 
     let _ = app.emit(
         "download://stage",
-        StageEvent { download_id: id.clone(), stage: "writing_cog".into() },
+        StageEvent {
+            download_id: id.clone(),
+            stage: "writing_cog".into(),
+        },
     );
     let bbox_3857 = bbox_3857_from_range(range);
     let out_path = PathBuf::from(&args.output_path);
-    if let Err(e) = write_cog(&img, &CogParams { bbox_3857, zoom: args.zoom }, &out_path) {
+    if let Err(e) = write_cog(
+        &img,
+        &CogParams {
+            bbox_3857,
+            zoom: args.zoom,
+        },
+        &out_path,
+    ) {
         let _ = app.emit(
             "download://done",
             DoneEvent::Err {
@@ -261,7 +283,10 @@ async fn run_pipeline(
     let preview_path = if args.write_preview_png {
         let _ = app.emit(
             "download://stage",
-            StageEvent { download_id: id.clone(), stage: "writing_preview".into() },
+            StageEvent {
+                download_id: id.clone(),
+                stage: "writing_preview".into(),
+            },
         );
         let pp = out_path.with_extension("preview.png");
         write_preview_png(&img, &pp, 1024)
@@ -333,9 +358,7 @@ pub async fn retry_failed(
     let Some(args) = runner.lookup_args(&download_id) else {
         return Err(format!("no args stashed for {}", download_id));
     };
-    let source_kind = SourceKind::parse(&args.source)
-        .or(Some(SourceKind::Esri))
-        .unwrap();
+    let source_kind = SourceKind::parse(&args.source).unwrap_or(SourceKind::Esri);
     let token = runner.register(download_id.clone());
     let app_clone = app.clone();
     let id_clone = download_id.clone();

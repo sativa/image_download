@@ -82,7 +82,8 @@ async fn download_all_empty_returns_empty() {
         4,
         CancellationToken::new(),
         move |p| p2.lock().unwrap().push(p),
-    ).await;
+    )
+    .await;
     assert!(result.is_empty());
     assert!(progress.lock().unwrap().is_empty());
 }
@@ -106,7 +107,8 @@ async fn download_all_respects_cancellation() {
         4,
         cancel,
         move |p| p2.lock().unwrap().push(p),
-    ).await;
+    )
+    .await;
     assert_eq!(result.len(), 5);
     assert!(result.iter().all(|t| t.bytes.is_none()));
     assert_eq!(progress.lock().unwrap().len(), 5);

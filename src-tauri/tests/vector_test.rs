@@ -2,7 +2,9 @@ use imagery_downloader_lib::core::vector::{parse_vector, ParsedVector};
 use std::path::PathBuf;
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 #[test]
@@ -63,12 +65,7 @@ fn make_gpkg_fixture(dir: &std::path::Path) -> std::path::PathBuf {
     )
     .unwrap();
 
-    let wkb = build_wkb_polygon(&[
-        [100.0, 30.0],
-        [102.0, 30.0],
-        [101.0, 32.0],
-        [100.0, 30.0],
-    ]);
+    let wkb = build_wkb_polygon(&[[100.0, 30.0], [102.0, 30.0], [101.0, 32.0], [100.0, 30.0]]);
     let mut blob = vec![0x47, 0x50, 0x00, 0x00]; // 'G','P', version=0, flags=0 (no envelope)
     blob.extend_from_slice(&4326i32.to_le_bytes());
     blob.extend_from_slice(&wkb);

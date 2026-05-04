@@ -26,8 +26,7 @@ fn fake_red_tile() -> Bytes {
 #[test]
 fn pipeline_geojson_to_cog() {
     // 1. Parse a vector file
-    let geojson = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/triangle.geojson");
+    let geojson = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/triangle.geojson");
     let pv = parse_vector(&geojson).unwrap();
 
     // 2. Compute tile range at z=8
@@ -37,7 +36,10 @@ fn pipeline_geojson_to_cog() {
     // 3. Fake fetch: every tile gets the same red PNG
     let tiles: Vec<DownloadedTile> = range
         .iter()
-        .map(|c: TileCoord| DownloadedTile { coord: c, bytes: Some(fake_red_tile()) })
+        .map(|c: TileCoord| DownloadedTile {
+            coord: c,
+            bytes: Some(fake_red_tile()),
+        })
         .collect();
 
     // 4. Stitch

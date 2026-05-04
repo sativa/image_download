@@ -1,4 +1,4 @@
-use imagery_downloader_lib::core::history::{Store, HistoryEntry};
+use imagery_downloader_lib::core::history::{HistoryEntry, Store};
 use std::path::PathBuf;
 
 fn tmp_path() -> PathBuf {
@@ -53,7 +53,9 @@ fn dedupe_by_bbox_zoom_source() {
 #[test]
 fn caps_at_10() {
     let s = Store::open(tmp_path()).unwrap();
-    for z in 8..=22 { s.add(entry(z)).unwrap(); }
+    for z in 8..=22 {
+        s.add(entry(z)).unwrap();
+    }
     let l = s.list();
     assert_eq!(l.len(), 10);
     // newest still on top

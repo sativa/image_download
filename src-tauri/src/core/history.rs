@@ -40,7 +40,10 @@ impl Store {
         } else {
             Vec::new()
         };
-        Ok(Self { path, inner: Mutex::new(inner) })
+        Ok(Self {
+            path,
+            inner: Mutex::new(inner),
+        })
     }
 
     pub fn list(&self) -> Vec<HistoryEntry> {
@@ -51,7 +54,9 @@ impl Store {
         let mut g = self.inner.lock().unwrap();
         g.retain(|e| !(e.bbox == entry.bbox && e.zoom == entry.zoom && e.source == entry.source));
         g.insert(0, entry);
-        if g.len() > MAX { g.truncate(MAX); }
+        if g.len() > MAX {
+            g.truncate(MAX);
+        }
         self.persist(&g)?;
         Ok(())
     }
@@ -64,7 +69,9 @@ impl Store {
     }
 
     fn persist(&self, list: &[HistoryEntry]) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = self.path.with_extension("json.tmp");
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&serde_json::to_vec_pretty(list).unwrap())?;

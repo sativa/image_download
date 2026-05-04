@@ -1,5 +1,5 @@
-use imagery_downloader_lib::core::cog::{write_cog, write_preview_png, CogParams};
 use image::{ImageBuffer, Rgba};
+use imagery_downloader_lib::core::cog::{write_cog, write_preview_png, CogParams};
 use tempfile::tempdir;
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
@@ -51,7 +51,8 @@ fn cog_carries_geotiff_tags() {
     assert_eq!(tp[3], 0.0);
     assert_eq!(tp[4], 100.0);
 
-    let keys = dec.get_tag_u32_vec(Tag::Unknown(34735))
+    let keys = dec
+        .get_tag_u32_vec(Tag::Unknown(34735))
         .or_else(|_| dec.get_tag_u32_vec(Tag::Unknown(34735)))
         .unwrap_or_default();
     let _ = keys;

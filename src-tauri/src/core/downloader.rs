@@ -90,7 +90,12 @@ where
                 let cancel = cancel_inner.clone();
                 async move {
                     if cancel.is_cancelled() {
-                        let _ = tx.send(DownloadedTile { coord: c, bytes: None }).await;
+                        let _ = tx
+                            .send(DownloadedTile {
+                                coord: c,
+                                bytes: None,
+                            })
+                            .await;
                         return;
                     }
                     let url = url_for_tile(source, c);
@@ -109,7 +114,11 @@ where
         let nb = tile.bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
         let new_bytes = bytes_total.fetch_add(nb, std::sync::atomic::Ordering::Relaxed) + nb;
         let new_completed = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let last_failed = if tile.bytes.is_none() { Some(tile.coord) } else { None };
+        let last_failed = if tile.bytes.is_none() {
+            Some(tile.coord)
+        } else {
+            None
+        };
         on_progress(ProgressUpdate {
             completed: new_completed,
             total,
@@ -131,12 +140,16 @@ pub struct TileCache {
 }
 
 impl Default for TileCache {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TileCache {
     pub fn new() -> Self {
-        Self { inner: TokioMutex::new(HashMap::new()) }
+        Self {
+            inner: TokioMutex::new(HashMap::new()),
+        }
     }
     pub async fn put(&self, c: TileCoord, b: Bytes) {
         self.inner.lock().await.insert(c, b);
