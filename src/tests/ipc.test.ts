@@ -1,9 +1,17 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, beforeAll, afterAll } from "vitest";
 
 const invokeMock = vi.fn();
 const listenMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invokeMock(...a) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: (...a: unknown[]) => listenMock(...a) }));
+
+// Pretend we're inside Tauri so ipc.ts doesn't short-circuit to noop
+beforeAll(() => {
+  (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
+});
+afterAll(() => {
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+});
 
 beforeEach(() => {
   invokeMock.mockReset();
