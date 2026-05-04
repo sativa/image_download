@@ -349,3 +349,27 @@ New Plan B follow-ups:
 - retry_failed tile-cache reuse (only refetch missing — currently full re-run).
 - Live UI test against `pnpm tauri dev` to verify event throttling under real network.
 - `auto` source actually probes both providers (currently falls back to Esri).
+
+---
+
+## Real-world Plan D Validation (2026-05-04)
+
+After the first push to GitHub, two constraints surfaced that weren't documented in the original plan:
+
+1. **Windows MSI rejects non-numeric pre-release identifiers.** Tags like `v0.0.1-test` or `v0.0.1-rc1` fail with `optional pre-release identifier in app version must be numeric-only and cannot be greater than 65535 for msi target`. Workaround: cut a real `v0.0.1` directly (release stays in draft mode for safety) instead of a `-test` dry-run, OR use numeric-only identifiers like `v0.0.1-1`.
+
+2. **`tauri-action` triggers keychain import even for empty `APPLE_CERTIFICATE` env vars.** Setting `APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}` when the secret is undefined still passes `""` to the action, which attempts `security import` on it and fails. Fix: don't set any APPLE_* env at all until real secrets exist (`docs/SIGNING.md` updated). Action picks the unsigned path automatically when env is absent.
+
+3. **CI bundle verification path mismatch.** The macOS aarch64 leg passes `--target aarch64-apple-darwin` to tauri build, which puts artifacts in `src-tauri/target/aarch64-apple-darwin/release/bundle/` instead of `src-tauri/target/release/bundle/`. `scripts/check-bundle.mjs` only inspects the latter. Fix: macOS arm64 leg drops `--target` (macos-latest is already arm64 native), keeping `--target` only for the Intel cross-compile leg. Bundle verification then restricted to legs with `matrix.target == ''`.
+
+Plan D's plan document is left unchanged; these are status-quo facts captured here for future reference.
+
+### Release v0.0.1 confirmed shipping
+
+Tag `v0.0.1` pushed 2026-05-04 produced 6 release artifacts (draft):
+- `Imagery.Downloader_0.0.1_aarch64.dmg` (macOS Apple Silicon)
+- `Imagery.Downloader_0.0.1_x64.dmg` (macOS Intel)
+- `Imagery.Downloader_0.0.1_x64_en-US.msi` (Windows MSI)
+- `Imagery.Downloader_0.0.1_x64-setup.exe` (Windows NSIS)
+- `Imagery.Downloader_aarch64.app.tar.gz` (macOS updater bundle)
+- `Imagery.Downloader_x64.app.tar.gz` (macOS Intel updater bundle)

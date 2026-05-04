@@ -62,6 +62,15 @@ Steps:
    from the `.pfx`'s SHA-1, or rely on tauri-action env injection.
 4. Cut a new release.
 
+## Important: env vars must NOT be set when secrets are missing
+
+`tauri-action` interprets a non-empty `APPLE_CERTIFICATE` env var as
+"please import this certificate into the keychain". Even an empty string
+from an unset GitHub secret will trigger the import attempt and fail with
+`failed to import keychain certificate`. The current `release.yml` solves
+this by **not setting any APPLE_* env at all**. When you enable signing,
+re-add the env block — the secret values themselves will be non-empty.
+
 ## Why not now
 
 - Apple Developer Program is $99/yr — defer until a public release is
