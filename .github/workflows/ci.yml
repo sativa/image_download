@@ -64,12 +64,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-latest is arm64; native build leaves bundle in target/release/bundle/
           - platform: macos-latest
-            target: aarch64-apple-darwin
+            target: ""
+            cache_key: macos-aarch64
           - platform: macos-latest
             target: x86_64-apple-darwin
+            cache_key: macos-x64
           - platform: windows-latest
             target: ""
+            cache_key: windows-x64
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -86,7 +90,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: ${{ matrix.platform }}-${{ matrix.target }}
+          key: ${{ matrix.cache_key }}
       - run: pnpm install --frozen-lockfile
       - name: Tauri build
         shell: bash
@@ -98,7 +102,7 @@ jobs:
           else
             pnpm tauri build
           fi
-      - name: Verify bundle artifacts (current host arch only)
-        if: matrix.target == '' || matrix.target == 'aarch64-apple-darwin'
+      - name: Verify bundle artifacts (native legs only — output is in target/release/bundle)
+        if: matrix.target == ''
         shell: bash
         run: node scripts/check-bundle.mjs
