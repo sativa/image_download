@@ -22,11 +22,27 @@ pub enum DownloadError {
     Cancelled,
 }
 
-/// Fetch one URL with exponential backoff; up to `max_retries`. Returns bytes on success.
-pub async fn download_one(url: &str, cfg: &DownloadConfig) -> Result<Bytes, DownloadError> {
-    let client = reqwest::Client::builder()
+/// Build a reqwest client suitable for tile fetching: keep-alive enabled,
+/// reasonable per-request timeout, real-looking UA so Google / ESRI don't
+/// 403 us, and HTTP/2 prior knowledge disabled (some CDNs misbehave on h2).
+pub fn build_client(cfg: &DownloadConfig) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
         .timeout(cfg.timeout_per_request)
-        .build()?;
+        .user_agent(concat!(
+            "imagery-downloader/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/sativa/image_download)"
+        ))
+        .pool_max_idle_per_host(16)
+        .build()
+}
+
+/// Fetch one URL with exponential backoff; up to `max_retries`. Returns bytes on success.
+pub async fn download_one(
+    client: &reqwest::Client,
+    url: &str,
+    cfg: &DownloadConfig,
+) -> Result<Bytes, DownloadError> {
     let mut last_status: u16 = 0;
     for attempt in 0..=cfg.max_retries {
         let resp = client.get(url).send().await;
@@ -80,14 +96,33 @@ where
     let bytes_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (tx, mut rx) = tokio::sync::mpsc::channel::<DownloadedTile>(max_concurrency * 2);
 
+    // Single shared client across all tiles — keep-alive + connection pooling.
+    // Without this, every tile spawned a new TCP+TLS handshake and Google/ESRI
+    // would 429 / drop us within seconds.
+    let client = match build_client(&cfg) {
+        Ok(c) => Arc::new(c),
+        Err(_) => {
+            // Build failed — return all tiles as failed without progress emits.
+            return coords
+                .into_iter()
+                .map(|c| DownloadedTile {
+                    coord: c,
+                    bytes: None,
+                })
+                .collect();
+        }
+    };
+
     let cancel_inner = cancel.clone();
     let cfg_inner = cfg.clone();
+    let client_inner = client.clone();
     let driver = tokio::spawn(async move {
         stream::iter(coords)
             .for_each_concurrent(max_concurrency, |c| {
                 let tx = tx.clone();
                 let cfg = cfg_inner.clone();
                 let cancel = cancel_inner.clone();
+                let client = client_inner.clone();
                 async move {
                     if cancel.is_cancelled() {
                         let _ = tx
@@ -100,7 +135,7 @@ where
                     }
                     let url = url_for_tile(source, c);
                     let bytes = tokio::select! {
-                        r = download_one(&url, &cfg) => r.ok(),
+                        r = download_one(&client, &url, &cfg) => r.ok(),
                         _ = cancel.cancelled() => None,
                     };
                     let _ = tx.send(DownloadedTile { coord: c, bytes }).await;

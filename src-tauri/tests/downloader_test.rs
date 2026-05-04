@@ -1,4 +1,4 @@
-use imagery_downloader_lib::core::downloader::{download_one, DownloadConfig};
+use imagery_downloader_lib::core::downloader::{build_client, download_one, DownloadConfig};
 use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -9,6 +9,10 @@ fn config() -> DownloadConfig {
         backoff_base: Duration::from_millis(10),
         timeout_per_request: Duration::from_secs(2),
     }
+}
+
+fn client() -> reqwest::Client {
+    build_client(&config()).expect("client build")
 }
 
 #[tokio::test]
@@ -22,7 +26,7 @@ async fn download_one_succeeds_on_first_try() {
         .await;
 
     let url = format!("{}/t", server.uri());
-    let bytes = download_one(&url, &config()).await.unwrap();
+    let bytes = download_one(&client(), &url, &config()).await.unwrap();
     assert_eq!(bytes.as_ref(), &[1, 2, 3]);
 }
 
@@ -42,7 +46,7 @@ async fn download_one_retries_then_succeeds() {
         .await;
 
     let url = format!("{}/t", server.uri());
-    let bytes = download_one(&url, &config()).await.unwrap();
+    let bytes = download_one(&client(), &url, &config()).await.unwrap();
     assert_eq!(bytes.as_ref(), &[9]);
 }
 
@@ -56,7 +60,7 @@ async fn download_one_gives_up_after_max_retries() {
         .await;
 
     let url = format!("{}/t", server.uri());
-    let err = download_one(&url, &config()).await.unwrap_err();
+    let err = download_one(&client(), &url, &config()).await.unwrap_err();
     assert!(err.to_string().contains("503") || err.to_string().contains("retries"));
 }
 
