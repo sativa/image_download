@@ -5,6 +5,13 @@
 //! - GeoTIFF tags (PixelScale + Tiepoint + GeoKey EPSG:3857).
 //! - Atomic write via tempfile + rename.
 //! - Optional preview.png via the image crate.
+//!
+//! Overview pyramid not implemented: tiff@0.10's encoder API only allows one
+//! image per file via `new_image()`. Adding pyramid requires either upgrading
+//! to a future tiff release that supports multi-IFD writes, or hand-rolling the
+//! TIFF byte layout (multiple IFDs chained via NextIFDOffset). Files written
+//! here are still valid GeoTIFFs that QGIS / GDAL load correctly — just not
+//! "cloud-optimized" in the streaming sense. Plan-B follow-up.
 
 use anyhow::Result;
 use image::RgbaImage;
@@ -63,3 +70,51 @@ pub fn write_cog(img: &RgbaImage, p: &CogParams, path: &Path) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+use crate::core::tiles::TileRange;
+
+const EARTH_HALF_CIRC_M: f64 = 20037508.3427892;
+
+/// Convert a TileRange to its EPSG:3857 bbox [west, south, east, north].
+pub fn bbox_3857_from_range(r: TileRange) -> [f64; 4] {
+    let n = 2_f64.powi(r.z as i32);
+    let cell = 2.0 * EARTH_HALF_CIRC_M / n;
+    let west = -EARTH_HALF_CIRC_M + r.x_min as f64 * cell;
+    let east = -EARTH_HALF_CIRC_M + (r.x_max + 1) as f64 * cell;
+    let north = EARTH_HALF_CIRC_M - r.y_min as f64 * cell;
+    let south = EARTH_HALF_CIRC_M - (r.y_max + 1) as f64 * cell;
+    [west, south, east, north]
+}
+
+/// Write a downsampled PNG preview alongside the GeoTIFF.
+/// `max_dim` caps the longer edge — small previews load instantly in image viewers.
+pub fn write_preview_png(img: &RgbaImage, path: &Path, max_dim: u32) -> Result<()> {
+    let scale = (max_dim as f64 / img.width().max(img.height()) as f64).min(1.0);
+    let preview = if scale < 1.0 {
+        let w = (img.width() as f64 * scale) as u32;
+        let h = (img.height() as f64 * scale) as u32;
+        image::imageops::resize(img, w, h, image::imageops::FilterType::Triangle)
+    } else {
+        img.clone()
+    };
+    let tmp = path.with_extension("png.tmp");
+    preview.save_with_format(&tmp, image::ImageFormat::Png)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::tiles::TileRange;
+
+    #[test]
+    fn world_at_zoom_zero() {
+        let bb = bbox_3857_from_range(TileRange { x_min: 0, y_min: 0, x_max: 0, y_max: 0, z: 0 });
+        assert!((bb[0] + EARTH_HALF_CIRC_M).abs() < 1.0);
+        assert!((bb[2] - EARTH_HALF_CIRC_M).abs() < 1.0);
+        assert!((bb[3] - EARTH_HALF_CIRC_M).abs() < 1.0);
+        assert!((bb[1] + EARTH_HALF_CIRC_M).abs() < 1.0);
+    }
+}
+

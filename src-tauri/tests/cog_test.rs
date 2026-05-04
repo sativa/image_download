@@ -1,4 +1,4 @@
-use imagery_downloader_lib::core::cog::{write_cog, CogParams};
+use imagery_downloader_lib::core::cog::{write_cog, write_preview_png, CogParams};
 use image::{ImageBuffer, Rgba};
 use tempfile::tempdir;
 use tiff::decoder::Decoder;
@@ -58,4 +58,15 @@ fn cog_carries_geotiff_tags() {
     // Some tiff readers expose GeoKey as u16 vec; both should contain 3857
     let keys_u16 = dec.get_tag(Tag::Unknown(34735)).ok();
     assert!(keys_u16.is_some(), "GeoKeyDirectory tag should be present");
+}
+
+#[test]
+fn preview_png_smaller_than_max() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("p.png");
+    let img: image::RgbaImage = ImageBuffer::from_pixel(2048, 2048, Rgba([0, 100, 0, 255]));
+    write_preview_png(&img, &p, 512).unwrap();
+    let read = image::open(&p).unwrap();
+    assert!(read.width() <= 512);
+    assert!(read.height() <= 512);
 }
