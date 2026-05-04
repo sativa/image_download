@@ -297,3 +297,28 @@ Pending (require user action — cannot be performed by the agent):
 - **Task 3.4**: tag `v0.0.1` (real first milestone) and push; leave the produced GitHub Release as draft until Plan A/B land.
 
 Outstanding: Plan A (real Rust modules) and Plan B (real commands replacing `src-tauri/src/mocks/`) are not yet planned in this repo.
+
+---
+
+## Plan A Implementation Status (2026-05-04)
+
+✅ `core/tiles.rs`: lon/lat ↔ XYZ math + TileRange + iter; 13 unit + 2 property tests.
+✅ `core/sources.rs`: Esri + Google URL templates; pick_auto via latency probe; 3 unit + 2 wiremock tests.
+✅ `core/downloader.rs`: download_one with exponential-backoff retry; download_all with for_each_concurrent + CancellationToken + progress callback; TileCache. 6 wiremock tests.
+✅ `core/stitcher.rs`: stitch_rgba with transparent failed tiles + corrupt-bytes safety. 3 unit tests.
+✅ `core/cog.rs`: TIFF write with GeoTIFF tags (PixelScale, Tiepoint, GeoKey EPSG:3857); atomic tempfile+rename; bbox_3857_from_range helper; write_preview_png. 1 unit + 3 integration tests.
+✅ `core/vector.rs`: GeoJSON / Shapefile (parser only) / GPKG (rusqlite + WKB POLYGON). 3 integration tests.
+✅ E2E test: vector→tiles→fake fetch→stitch→cog→tiff readback (`tests/e2e_test.rs`).
+✅ `core/README.md` documents Plan B replacement contract.
+
+Test totals: **lib unit 19** (1 ignored real-network) + **integration 22** = **41 Rust tests** all green.
+
+Pending follow-ups (documented in `core/README.md`):
+- COG deflate compression (tiff@0.10 API limitation).
+- COG overview pyramid (tiff@0.10 single-IFD limitation).
+- Sources URL injection for full-stack integration tests.
+- Multi-layer GPKG / WKB types beyond POLYGON.
+- Shapefile fixture-generation test.
+
+Plan B can now wire these into Tauri commands by deleting `mocks/` and
+adding `commands/` per the contract in `core/README.md`.
