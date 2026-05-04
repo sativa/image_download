@@ -168,6 +168,21 @@
     map.fitBounds([[w, s], [e, n]], { padding: 40, animate: false });
     persistBboxLayer(new maplibregl.LngLatBounds([w, s], [e, n]));
   });
+
+  // Live ground-resolution at the current download zoom + bbox center latitude.
+  // Web-mercator pixel size: (40075016.686 * cos(lat)) / (2^z * 256)
+  let metersPerPixel = $derived.by(() => {
+    const lat = (input.bbox[1] + input.bbox[3]) / 2;
+    if (!Number.isFinite(lat)) return null;
+    const cos = Math.cos((lat * Math.PI) / 180);
+    return (40075016.686 * Math.abs(cos)) / (Math.pow(2, input.zoom) * 256);
+  });
+
+  function fmtMpp(m: number): string {
+    if (m < 1) return `${(m * 100).toFixed(1)} cm/px`;
+    if (m < 1000) return `${m.toFixed(1)} m/px`;
+    return `${(m / 1000).toFixed(2)} km/px`;
+  }
 </script>
 
 <div
@@ -182,6 +197,12 @@
       <button onclick={disableDraw}>Cancel draw</button>
     {:else}
       <button onclick={enableDraw}>Draw rectangle</button>
+    {/if}
+  </div>
+  <div class="zoom-badge">
+    <strong>z{input.zoom}</strong>
+    {#if metersPerPixel !== null}
+      <span>· {fmtMpp(metersPerPixel)}</span>
     {/if}
   </div>
   {#if dragOver}
@@ -199,6 +220,20 @@
     left: 1rem;
     z-index: 10;
   }
+  .zoom-badge {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    z-index: 10;
+    background: rgba(0, 0, 0, 0.65);
+    color: white;
+    padding: 0.35rem 0.7rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-family: ui-monospace, Menlo, monospace;
+    pointer-events: none;
+  }
+  .zoom-badge strong { color: #4fb0ff; font-weight: 600; }
   .drop-overlay {
     position: absolute;
     inset: 0;
