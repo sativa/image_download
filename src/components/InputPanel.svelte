@@ -46,6 +46,14 @@
     !bboxErr && !zoomErr && input.outputPath.length > 0 && download.id === null,
   );
 
+  let blockedReason = $derived.by(() => {
+    if (download.id) return "Download in progress…";
+    if (bboxErr) return bboxErr;
+    if (zoomErr) return zoomErr;
+    if (input.outputPath.length === 0) return "Pick an output .tif path first";
+    return null;
+  });
+
   async function start() {
     try {
       download.finished = false;
@@ -167,6 +175,9 @@
   <button class="primary" disabled={!canStart} onclick={start}>
     {download.id ? "Downloading…" : "Start download"}
   </button>
+  {#if blockedReason}
+    <p class="hint-blocked">{blockedReason}</p>
+  {/if}
 </section>
 
 <style>
@@ -191,6 +202,12 @@
     padding: 0.5rem 0.7rem;
     border-radius: 6px;
     font-size: 0.85rem;
+  }
+  .hint-blocked {
+    color: var(--fg-muted);
+    font-size: 0.8rem;
+    margin: -0.3rem 0 0;
+    text-align: center;
   }
   .primary {
     background: var(--accent);
