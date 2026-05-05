@@ -4,6 +4,18 @@
   import { onProgress, onStage, onDone, onTileFailed, cancelDownload, retryFailed } from "../lib/ipc";
   import { formatBytes, formatDuration, formatNumber } from "../lib/format";
 
+  // Time after successful done.ok before the panel auto-clears so the user
+  // can immediately start a new download without clicking Dismiss.
+  const AUTO_DISMISS_MS = 3000;
+  let autoDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearAutoDismiss() {
+    if (autoDismissTimer !== null) {
+      clearTimeout(autoDismissTimer);
+      autoDismissTimer = null;
+    }
+  }
+
   onMount(() => {
     const offs: (() => void)[] = [];
     onProgress((p) => { if (p.download_id === download.id) download.progress = p; })
@@ -17,13 +29,24 @@
       download.finished = true;
       if (d.ok) {
         pushToast("info", `Done · ${formatNumber(d.total_tiles)} tiles · ${d.duration_sec.toFixed(1)}s`);
+        // Successful run: auto-clear to "No active download" so the Start
+        // button (in InputPanel) re-enables. Failed runs stay visible so
+        // the user can read the error and decide to retry.
+        clearAutoDismiss();
+        autoDismissTimer = setTimeout(() => {
+          // Only reset if still the same download (user might have already started another).
+          if (download.finished && !download.error) reset();
+        }, AUTO_DISMISS_MS);
       } else {
         download.error = d.error;
         pushToast("error", `Download failed: ${d.error}`);
       }
     }).then((u) => offs.push(u));
 
-    return () => offs.forEach((u) => u());
+    return () => {
+      clearAutoDismiss();
+      offs.forEach((u) => u());
+    };
   });
 
   let pct = $derived(
@@ -32,15 +55,28 @@
       : 0,
   );
 
+  // After all tiles are fetched (pct==100) but the pipeline is still working
+  // (stitching / writing_cog / writing_preview), show an indeterminate bar
+  // so the panel doesn't look frozen.
+  let busyAfterFetch = $derived(
+    pct >= 100 &&
+      !download.finished &&
+      download.stage !== null &&
+      download.stage !== "downloading"
+  );
+
   async function cancel() {
     if (!download.id) return;
+    clearAutoDismiss();
     try { await cancelDownload(download.id); } catch (e) { pushToast("error", String(e)); }
   }
   async function retry() {
     if (!download.id) return;
+    clearAutoDismiss();
     try { await retryFailed(download.id); } catch (e) { pushToast("error", String(e)); }
   }
   function reset() {
+    clearAutoDismiss();
     download.id = null;
     download.progress = null;
     download.stage = null;
@@ -63,7 +99,9 @@
       {/if}
     </div>
 
-    <div class="bar"><div class="fill" style="width:{pct}%"></div></div>
+    <div class="bar" class:indeterminate={busyAfterFetch}>
+      <div class="fill" style="width:{pct}%"></div>
+    </div>
 
     {#if download.progress}
       <div class="row">
@@ -101,8 +139,20 @@
     font-size: 0.85rem;
     flex-wrap: wrap;
   }
-  .bar { height: 8px; background: var(--bg-elev); border-radius: 4px; overflow: hidden; }
+  .bar { height: 8px; background: var(--bg-elev); border-radius: 4px; overflow: hidden; position: relative; }
   .fill { height: 100%; background: var(--accent); transition: width 200ms; }
+  .bar.indeterminate .fill {
+    background: linear-gradient(
+      90deg,
+      transparent 0%, var(--accent) 50%, transparent 100%
+    );
+    background-size: 200% 100%;
+    animation: stripe 1.4s linear infinite;
+  }
+  @keyframes stripe {
+    from { background-position: 200% 0; }
+    to   { background-position: -200% 0; }
+  }
   .warn { color: var(--warn); margin: 0; font-size: 0.85rem; }
   .actions { display: flex; gap: 0.5rem; margin-top: 0.3rem; }
 </style>
