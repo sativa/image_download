@@ -478,22 +478,6 @@ async fn run_pipeline(
         log::warn!("clear job state failed: {e}");
     }
 
-    let preview_path = if args.write_preview_png {
-        let _ = app.emit(
-            "download://stage",
-            StageEvent {
-                download_id: id.clone(),
-                stage: "writing_preview".into(),
-            },
-        );
-        let pp = out_path.with_extension("preview.png");
-        write_preview_png(&img, &pp, 1024)
-            .ok()
-            .map(|_| pp.to_string_lossy().into_owned())
-    } else {
-        None
-    };
-
     let duration_sec = start.elapsed().as_secs_f64();
     let output_size_mb = std::fs::metadata(&out_path)
         .map(|m| m.len() as f64 / 1.0e6)
@@ -511,13 +495,30 @@ async fn run_pipeline(
         HistoryEntry::STATUS_COMPLETED,
     );
 
+    // For huge images (e.g. 5.9 GB+ RGBA8), write_preview_png's Triangle resize
+    // can take many minutes single-threaded. Emit `done` BEFORE the preview so
+    // the UI dismisses promptly and the user can move on. The expected preview
+    // path is reported up-front; if the file shows up later, the COG sidecar
+    // is correct. If the preview write fails, only a log warn — COG itself is
+    // already on disk.
+    let preview_intended = if args.write_preview_png {
+        Some(
+            out_path
+                .with_extension("preview.png")
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
+
     let _ = app.emit(
         "download://done",
         DoneEvent::Ok {
-            download_id: id,
+            download_id: id.clone(),
             ok: true,
             output_path: written_path,
-            preview_path,
+            preview_path: preview_intended,
             bbox: args.bbox,
             zoom: args.zoom,
             source_used: source.as_str().into(),
@@ -527,6 +528,23 @@ async fn run_pipeline(
             output_size_mb,
         },
     );
+
+    if args.write_preview_png {
+        // Stage event arrives after `done` — front-end has already auto-dismissed
+        // by the time it lands, which is fine; backend just notes the work for
+        // anyone reading the log.
+        let _ = app.emit(
+            "download://stage",
+            StageEvent {
+                download_id: id.clone(),
+                stage: "writing_preview".into(),
+            },
+        );
+        let pp = out_path.with_extension("preview.png");
+        if let Err(e) = write_preview_png(&img, &pp, 1024) {
+            log::warn!("preview write failed: {e}");
+        }
+    }
 }
 
 #[tauri::command]
