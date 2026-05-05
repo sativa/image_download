@@ -473,10 +473,11 @@ async fn run_pipeline(
         return;
     }
 
-    // COG written; the job's tiles cache and WAL are no longer needed.
-    if let Err(e) = job.clear_state() {
-        log::warn!("clear job state failed: {e}");
-    }
+    // NB: do NOT clear job state here. The tile cache + WAL must outlive
+    // history record + done emit + preview write — if we crash between
+    // write_cog and history persistence, a stale "in_progress" row would
+    // be stranded with no way to resume. clear_state() runs at the very
+    // end, after every artefact has been finalised.
 
     let duration_sec = start.elapsed().as_secs_f64();
     let output_size_mb = std::fs::metadata(&out_path)
@@ -541,9 +542,19 @@ async fn run_pipeline(
             },
         );
         let pp = out_path.with_extension("preview.png");
-        if let Err(e) = write_preview_png(&img, &pp, 1024) {
+        // 512 px max-edge: 'rough thumbnail' resolution. With the parallel
+        // nearest-neighbor sampler in core::cog::write_preview_png this is
+        // sub-second even on multi-gigapixel sources.
+        if let Err(e) = write_preview_png(&img, &pp, 512) {
             log::warn!("preview write failed: {e}");
         }
+    }
+
+    // All artefacts (COG + history row + done event + preview) are finalised.
+    // NOW it's safe to clear the job's tiles cache + WAL. If anything above
+    // crashed, the cache survives so a re-run can resume.
+    if let Err(e) = job.clear_state() {
+        log::warn!("clear job state failed: {e}");
     }
 }
 
