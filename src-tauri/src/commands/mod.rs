@@ -6,4 +6,5 @@
 pub mod download;
 pub mod history;
 pub mod runner;
+pub mod sources;
 pub mod vector;

@@ -12,6 +12,8 @@ Thumbs.db
 .playwright-mcp/
 plan-c-*.png
 plan-d-*.png
+zoom-badge*.png
+post-ipc-fallback.png
 /tmp/
 
 # Python (legacy/ subtree)

@@ -85,10 +85,42 @@ pub async fn download_all<F>(
     cfg: DownloadConfig,
     max_concurrency: usize,
     cancel: CancellationToken,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Vec<DownloadedTile>
 where
     F: FnMut(ProgressUpdate) + Send + 'static,
+{
+    download_all_with_sink(
+        coords,
+        source,
+        cfg,
+        max_concurrency,
+        cancel,
+        on_progress,
+        |_, _| {}, // no-op tile sink: caller doesn't care about per-tile bytes
+    )
+    .await
+}
+
+/// Same as `download_all`, plus a callback invoked exactly once per
+/// successfully downloaded tile, *before* the tile is forwarded to the
+/// progress aggregator. Use this to persist tile bytes to disk for resume.
+///
+/// The sink runs on the channel-receiver task (single-threaded) so
+/// implementations don't need to be Sync / handle reentrancy. It runs
+/// synchronously — keep it short. For larger work (e.g. fsync), spawn_blocking.
+pub async fn download_all_with_sink<F, S>(
+    coords: Vec<TileCoord>,
+    source: SourceKind,
+    cfg: DownloadConfig,
+    max_concurrency: usize,
+    cancel: CancellationToken,
+    mut on_progress: F,
+    mut on_tile_success: S,
+) -> Vec<DownloadedTile>
+where
+    F: FnMut(ProgressUpdate) + Send + 'static,
+    S: FnMut(TileCoord, &Bytes) + Send + 'static,
 {
     let total = coords.len() as u32;
     let cfg = Arc::new(cfg);
@@ -147,6 +179,12 @@ where
     let mut out = Vec::with_capacity(total as usize);
     while let Some(tile) = rx.recv().await {
         let nb = tile.bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
+        // Persist successful tile *before* counting it as completed — that way
+        // a crash between the WAL append and the progress emit just causes a
+        // duplicate progress event, never a phantom-completed tile.
+        if let Some(b) = tile.bytes.as_ref() {
+            on_tile_success(tile.coord, b);
+        }
         let new_bytes = bytes_total.fetch_add(nb, std::sync::atomic::Ordering::Relaxed) + nb;
         let new_completed = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         let last_failed = if tile.bytes.is_none() {

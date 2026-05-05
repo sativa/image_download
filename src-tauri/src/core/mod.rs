@@ -6,6 +6,7 @@
 pub mod cog;
 pub mod downloader;
 pub mod history;
+pub mod job;
 pub mod sources;
 pub mod stitcher;
 pub mod tiles;

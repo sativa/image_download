@@ -4,7 +4,14 @@
 
 export type Bbox = [number, number, number, number]; // [minLon, minLat, maxLon, maxLat], WGS84
 export type Source = "esri" | "google" | "auto";
-export type Stage = "downloading" | "stitching" | "writing_cog" | "writing_preview";
+// Known stages emitted by the backend, plus open-ended strings like
+// "resuming (N/M tiles already cached)" that the UI just displays verbatim.
+export type Stage =
+  | "downloading"
+  | "stitching"
+  | "writing_cog"
+  | "writing_preview"
+  | (string & {});
 
 export interface ParseVectorFileOk {
   bbox: Bbox;
@@ -77,15 +84,21 @@ export type DoneEvent =
     }
   | { download_id: string; ok: false; error: string };
 
+export type HistoryStatus = "in_progress" | "completed" | "cancelled" | "failed";
+
 export interface HistoryEntry {
   bbox: Bbox;
   zoom: number;
   source: Source;
   output_path: string;
+  /** Legacy success flag — true iff status === "completed" and failed_tiles === 0. */
   ok: boolean;
   duration_sec: number;
   total_tiles: number;
   failed_tiles: number;
   output_size_mb: number;
-  finished_at: string; // ISO 8601
+  finished_at: string; // "epoch:<unix-secs>" or ISO 8601
+  /** Tiles already downloaded when this row was last persisted. */
+  completed_tiles: number;
+  status: HistoryStatus;
 }

@@ -19,6 +19,7 @@ pub fn parse_vector(path: &Path) -> Result<ParsedVector> {
         Some("geojson") | Some("json") => parse_geojson(path),
         Some("shp") => parse_shapefile(path),
         Some("gpkg") => parse_gpkg(path),
+        Some("parquet") | Some("geoparquet") => parse_geoparquet(path),
         _ => Err(anyhow!("unsupported_format")),
     }
 }
@@ -255,4 +256,228 @@ fn parse_wkb(b: &[u8]) -> Result<geojson::Geometry> {
         rings.push(ring);
     }
     Ok(geojson::Geometry::new(geojson::Value::Polygon(rings)))
+}
+
+// ── GeoParquet support ───────────────────────────────────────────────────────
+//
+// GeoParquet stores geometries as WKB-encoded binary in a column whose name is
+// declared in the file's `geo` key-value metadata (JSON). Spec ≥1.1 also
+// stores per-column `bbox` metadata, which lets us short-circuit without
+// decoding any geometry.
+//
+// We use Apache Arrow/Parquet to read columns; for the geometry payload we
+// rely on the existing `parse_wkb()` only when the file is a single Polygon
+// (legacy AOI use-case). For multi-feature files we just compute bbox by
+// scanning WKB bytes for plausible lon/lat f64 pairs.
+
+fn parse_geoparquet(path: &Path) -> Result<ParsedVector> {
+    use arrow_array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
+
+    let file = File::open(path)?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| anyhow!("not a valid Parquet file: {e}"))?;
+
+    // The Parquet KV metadata holds the GeoParquet `geo` JSON string.
+    let geo_meta = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .as_ref()
+        .and_then(|kvs| kvs.iter().find(|kv| kv.key == "geo"))
+        .and_then(|kv| kv.value.as_ref())
+        .ok_or_else(|| anyhow!("not a GeoParquet file (missing `geo` metadata)"))?;
+    let geo: serde_json::Value = serde_json::from_str(geo_meta)
+        .map_err(|e| anyhow!("invalid `geo` metadata JSON: {e}"))?;
+
+    let primary_column = geo["primary_column"]
+        .as_str()
+        .ok_or_else(|| anyhow!("GeoParquet metadata has no primary_column"))?
+        .to_string();
+
+    // Reject non-WGS84 CRS — downstream tile math assumes EPSG:4326.
+    // GeoParquet defaults to OGC:CRS84 (lon/lat WGS84) when crs is absent.
+    if let Some(crs) = geo["columns"][&primary_column].get("crs") {
+        if let Some(crs_obj) = crs.as_object() {
+            // PROJJSON "id.code" or "id.authority"+"code" identifies the CRS.
+            let code = crs_obj
+                .get("id")
+                .and_then(|i| i.get("code"))
+                .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse().ok())));
+            if !matches!(code, None | Some(4326) | Some(4979)) {
+                return Err(anyhow!(
+                    "GeoParquet uses non-WGS84 CRS (code {:?}); reproject before importing",
+                    code
+                ));
+            }
+        }
+    }
+
+    // Fast path: column-level bbox is in metadata (GeoParquet 1.1+).
+    let total_rows = builder.metadata().file_metadata().num_rows() as u32;
+    if let Some(bbox_arr) = geo["columns"][&primary_column].get("bbox").and_then(|b| b.as_array()) {
+        if bbox_arr.len() == 4 {
+            let xs: Vec<f64> = bbox_arr.iter().filter_map(|v| v.as_f64()).collect();
+            if xs.len() == 4 {
+                let bbox = [xs[0], xs[1], xs[2], xs[3]];
+                return Ok(ParsedVector {
+                    bbox,
+                    geometry: bbox_polygon(bbox),
+                    layer_count: total_rows,
+                });
+            }
+        }
+    }
+
+    // Slow path: stream the geometry column and scan WKB bytes for lon/lat pairs.
+    let reader = builder.build().map_err(|e| anyhow!("parquet read: {e}"))?;
+    let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    let mut count: u32 = 0;
+
+    for batch in reader {
+        let batch = batch.map_err(|e| anyhow!("parquet batch: {e}"))?;
+        let col = batch
+            .column_by_name(&primary_column)
+            .ok_or_else(|| anyhow!("column `{}` missing from batch", primary_column))?;
+        let bin = col
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .ok_or_else(|| anyhow!("geometry column is not Binary; large-binary not yet handled"))?;
+        for i in 0..bin.len() {
+            if bin.is_null(i) {
+                continue;
+            }
+            wkb_extents_into(bin.value(i), &mut bbox);
+            count += 1;
+        }
+    }
+
+    if !bbox[0].is_finite() {
+        return Err(anyhow!("GeoParquet contains no readable geometries"));
+    }
+    Ok(ParsedVector {
+        bbox,
+        geometry: bbox_polygon(bbox),
+        layer_count: count,
+    })
+}
+
+/// Build a closed-ring polygon for a bbox `[minx, miny, maxx, maxy]`.
+fn bbox_polygon(b: [f64; 4]) -> geojson::Geometry {
+    let ring = vec![
+        vec![b[0], b[1]],
+        vec![b[2], b[1]],
+        vec![b[2], b[3]],
+        vec![b[0], b[3]],
+        vec![b[0], b[1]],
+    ];
+    geojson::Geometry::new(geojson::Value::Polygon(vec![ring]))
+}
+
+/// Walk a WKB byte stream and update `bbox` with every lon/lat point we find.
+/// Supports the common ISO WKB types (Point/LineString/Polygon and the Multi
+/// variants, plus GeometryCollection); ignores unknown types rather than
+/// failing — the goal is bbox coverage, not perfect geometry decoding.
+fn wkb_extents_into(b: &[u8], bbox: &mut [f64; 4]) {
+    let mut p = 0usize;
+    walk_wkb(b, &mut p, bbox);
+}
+
+fn walk_wkb(b: &[u8], p: &mut usize, bbox: &mut [f64; 4]) -> Option<()> {
+    if *p + 5 > b.len() {
+        return None;
+    }
+    let little = b[*p] == 1;
+    let read_u32 = |b: &[u8], i: usize| -> u32 {
+        let arr: [u8; 4] = b[i..i + 4].try_into().ok().unwrap_or([0; 4]);
+        if little {
+            u32::from_le_bytes(arr)
+        } else {
+            u32::from_be_bytes(arr)
+        }
+    };
+    let read_f64 = |b: &[u8], i: usize| -> f64 {
+        let arr: [u8; 8] = b[i..i + 8].try_into().ok().unwrap_or([0; 8]);
+        if little {
+            f64::from_le_bytes(arr)
+        } else {
+            f64::from_be_bytes(arr)
+        }
+    };
+    // Strip ISO WKB Z/M flags (0x80000000, 0x40000000) and EWKB SRID flag (0x20000000).
+    let raw_type = read_u32(b, *p + 1);
+    let typ = raw_type & 0xFF;
+    let has_srid = raw_type & 0x20000000 != 0;
+    *p += 5;
+    if has_srid {
+        *p += 4;
+    }
+
+    let feed = |x: f64, y: f64, bbox: &mut [f64; 4]| {
+        if x < bbox[0] {
+            bbox[0] = x;
+        }
+        if y < bbox[1] {
+            bbox[1] = y;
+        }
+        if x > bbox[2] {
+            bbox[2] = x;
+        }
+        if y > bbox[3] {
+            bbox[3] = y;
+        }
+    };
+
+    match typ {
+        1 => {
+            // POINT
+            if *p + 16 <= b.len() {
+                let (x, y) = (read_f64(b, *p), read_f64(b, *p + 8));
+                feed(x, y, bbox);
+                *p += 16;
+            }
+        }
+        2 => {
+            // LINESTRING
+            let n = read_u32(b, *p) as usize;
+            *p += 4;
+            for _ in 0..n {
+                if *p + 16 > b.len() {
+                    return None;
+                }
+                feed(read_f64(b, *p), read_f64(b, *p + 8), bbox);
+                *p += 16;
+            }
+        }
+        3 => {
+            // POLYGON
+            let n_rings = read_u32(b, *p) as usize;
+            *p += 4;
+            for _ in 0..n_rings {
+                if *p + 4 > b.len() {
+                    return None;
+                }
+                let n_pts = read_u32(b, *p) as usize;
+                *p += 4;
+                for _ in 0..n_pts {
+                    if *p + 16 > b.len() {
+                        return None;
+                    }
+                    feed(read_f64(b, *p), read_f64(b, *p + 8), bbox);
+                    *p += 16;
+                }
+            }
+        }
+        4..=7 => {
+            // MULTIPOINT (4) | MULTILINESTRING (5) | MULTIPOLYGON (6) | GEOMETRYCOLLECTION (7)
+            let n = read_u32(b, *p) as usize;
+            *p += 4;
+            for _ in 0..n {
+                walk_wkb(b, p, bbox)?;
+            }
+        }
+        _ => return None, // unknown type
+    }
+    Some(())
 }

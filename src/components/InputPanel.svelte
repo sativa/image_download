@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { input, estimate, download, pushToast } from "../lib/state.svelte";
+  import { input, estimate, download, pushToast, requestMapFit } from "../lib/state.svelte";
   import { validateBbox, validateZoom } from "../lib/validate";
   import type { Source } from "../lib/types";
-  import { save, open } from "@tauri-apps/plugin-dialog";
+  import { open } from "@tauri-apps/plugin-dialog";
   import { estimateOutput, startDownload, parseVectorFile } from "../lib/ipc";
   import { formatNumber, formatDuration } from "../lib/format";
 
@@ -50,7 +50,7 @@
     if (download.id) return "Download in progress…";
     if (bboxErr) return bboxErr;
     if (zoomErr) return zoomErr;
-    if (input.outputPath.length === 0) return "Pick an output .tif path first";
+    if (input.outputPath.length === 0) return "Pick an output folder first";
     return null;
   });
 
@@ -80,26 +80,32 @@
     const p = await open({
       title: "Select vector file",
       filters: [
-        { name: "Vector", extensions: ["geojson", "shp", "gpkg"] },
+        { name: "Vector", extensions: ["geojson", "json", "shp", "gpkg", "parquet", "geoparquet"] },
       ],
     });
     if (!p || Array.isArray(p)) return;
     try {
       const r = await parseVectorFile(p);
       input.bbox = r.bbox;
+      // Force the map to pan/zoom to the imported bbox even if the new region
+      // happens to fall inside the current view (anti-jitter would otherwise skip).
+      requestMapFit();
       pushToast("info", `Loaded ${r.layer_count} layer(s) from ${p}`);
     } catch (e) {
-      pushToast("warn", `Vector parsing pending Plan A — ${String(e)}`);
+      pushToast("warn", `Failed to parse vector file: ${String(e)}`);
     }
   }
 
   async function pickOutput() {
-    const p = await save({
-      title: "Save GeoTIFF as…",
-      defaultPath: "imagery.tif",
-      filters: [{ name: "GeoTIFF", extensions: ["tif"] }],
+    // Output is now a directory; the backend auto-names each run as
+    // `imagery_z{zoom}_{source}_{ts}.tif` inside it (see make_output_stem
+    // in src-tauri/src/commands/download.rs).
+    const p = await open({
+      title: "Choose output folder",
+      directory: true,
+      multiple: false,
     });
-    if (p) input.outputPath = p;
+    if (typeof p === "string") input.outputPath = p;
   }
 </script>
 
@@ -133,7 +139,7 @@
   {:else if mode === "draw"}
     <p class="muted">Draw a rectangle on the map. Coordinates appear here once you release.</p>
   {:else}
-    <p class="muted">Pick a .geojson, .shp or .gpkg file:</p>
+    <p class="muted">Pick a .geojson / .shp / .gpkg / .parquet (GeoParquet) file:</p>
     <button onclick={pickVector}>Choose file…</button>
     <p class="muted small">Parsing is implemented by Plan A; picker will wire through then.</p>
   {/if}
@@ -151,11 +157,38 @@
     </select>
   </label>
 
-  <label>Output
+  <div class="grid">
+    <label>Concurrent downloads <span class="hint">{input.maxConcurrency}</span>
+      <input
+        type="range"
+        min="1"
+        max="64"
+        step="1"
+        bind:value={input.maxConcurrency}
+      />
+      <p class="muted small">
+        Parallel HTTP requests. Higher is faster but may trigger rate limits / 429.
+        Recommended 8–32 for Esri/Google.
+      </p>
+    </label>
+    <label>Retries per tile <span class="hint">{input.retryPerTile}</span>
+      <input
+        type="number"
+        min="0"
+        max="10"
+        step="1"
+        bind:value={input.retryPerTile}
+      />
+      <p class="muted small">Per-tile retry attempts before giving up.</p>
+    </label>
+  </div>
+
+  <label>Output folder
     <div class="row">
-      <input type="text" placeholder="… select a .tif path" readonly value={input.outputPath} />
-      <button onclick={pickOutput}>Pick…</button>
+      <input type="text" placeholder="… choose a folder for the imagery" readonly value={input.outputPath} />
+      <button onclick={pickOutput}>Pick folder…</button>
     </div>
+    <p class="muted small">Files will be named <code>imagery_z{input.zoom}_{input.source}_&lt;timestamp&gt;.tif</code> inside the folder.</p>
   </label>
 
   <hr />

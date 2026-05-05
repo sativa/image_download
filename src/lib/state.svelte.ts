@@ -6,10 +6,22 @@ export const input = $state({
   zoom: 17,
   source: "esri" as Source,
   outputPath: "" as string,
-  maxConcurrency: 50,
+  // 16 is a safe default for Esri/Google tile servers; higher rates can trigger 429.
+  // User can crank to 64 in the UI if they're hitting their own / unthrottled source.
+  maxConcurrency: 16,
   retryPerTile: 3,
   writePreviewPng: true,
 });
+
+// Monotonically-incrementing token. Bumped from InputPanel.pickVector after a
+// successful import so MapPanel can fit the new bbox unconditionally —
+// bypassing the anti-jitter "already in view, skip" guard that's correct for
+// rectangle dragging but wrong for "I just dropped a file from another region".
+export const fitRequest = $state({ token: 0 });
+
+export function requestMapFit(): void {
+  fitRequest.token += 1;
+}
 
 // Latest estimate, refreshed on bbox/zoom/source change (debounced 200ms).
 export const estimate = $state<{

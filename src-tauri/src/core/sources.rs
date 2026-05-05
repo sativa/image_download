@@ -52,20 +52,45 @@ pub async fn probe_url(url: &str) -> Result<Duration, reqwest::Error> {
     Ok(start.elapsed())
 }
 
-/// Probe both Esri and Google and return the faster one. The sample tile is small
-/// (continent-scale, z=2) so probes finish in ~100 ms each.
-pub async fn pick_auto() -> SourceKind {
+/// Result of probing both sources. `_ms` fields are None on probe failure.
+#[derive(Debug, Clone)]
+pub struct ProbeReport {
+    pub esri_ms: Option<u64>,
+    pub google_ms: Option<u64>,
+    pub recommended: SourceKind,
+}
+
+/// Probe both Esri and Google in parallel and return latencies plus the
+/// recommended (faster, or only-reachable) source. Sample tile is small
+/// (continent-scale, z=2) so each probe finishes in ~100 ms.
+pub async fn probe_both() -> ProbeReport {
     let sample = TileCoord { x: 0, y: 0, z: 2 };
     let esri_url = url_for_tile(SourceKind::Esri, sample);
     let google_url = url_for_tile(SourceKind::Google, sample);
     let (esri, google) = tokio::join!(probe_url(&esri_url), probe_url(&google_url));
-    match (esri, google) {
-        (Ok(e), Ok(g)) if e <= g => SourceKind::Esri,
-        (Ok(_), Ok(_)) => SourceKind::Google,
-        (Ok(_), Err(_)) => SourceKind::Esri,
-        (Err(_), Ok(_)) => SourceKind::Google,
-        (Err(_), Err(_)) => SourceKind::Esri, // fallback
+
+    let esri_ms = esri.as_ref().ok().map(|d| d.as_millis() as u64);
+    let google_ms = google.as_ref().ok().map(|d| d.as_millis() as u64);
+
+    let recommended = match (esri_ms, google_ms) {
+        (Some(e), Some(g)) if e <= g => SourceKind::Esri,
+        (Some(_), Some(_)) => SourceKind::Google,
+        (Some(_), None) => SourceKind::Esri,
+        (None, Some(_)) => SourceKind::Google,
+        (None, None) => SourceKind::Esri, // fallback when both unreachable
+    };
+
+    ProbeReport {
+        esri_ms,
+        google_ms,
+        recommended,
     }
+}
+
+/// Convenience wrapper that only returns the recommended source. Existing
+/// callers (and tests) that don't care about latency keep working.
+pub async fn pick_auto() -> SourceKind {
+    probe_both().await.recommended
 }
 
 #[cfg(test)]
