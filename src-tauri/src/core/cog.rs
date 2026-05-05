@@ -34,39 +34,62 @@ pub struct CogParams {
 
 pub fn write_cog(img: &RgbaImage, p: &CogParams, path: &Path) -> Result<()> {
     let tmp = path.with_extension("tif.tmp");
+    // Classic TIFF caps file size at 4 GB (32-bit byte offsets). For uncompressed
+    // RGBA8 that's ~1.07 G pixels — comfortably exceeded by anything 35,000 px or
+    // wider. Switch to BigTIFF (64-bit offsets) when the raw payload + reasonable
+    // header overhead would breach the 4 GB cap.
+    let payload_bytes = (img.width() as u64) * (img.height() as u64) * 4;
+    let needs_bigtiff = payload_bytes > 3_500_000_000; // leave headroom under 4 GB
+
     {
         let f = File::create(&tmp)?;
-        let mut enc = TiffEncoder::new(BufWriter::new(f))?;
-        let mut tiff_img = enc.new_image::<colortype::RGBA8>(img.width(), img.height())?;
-
-        let pixel_size_x = (p.bbox_3857[2] - p.bbox_3857[0]) / img.width() as f64;
-        let pixel_size_y = (p.bbox_3857[3] - p.bbox_3857[1]) / img.height() as f64;
-        let pixel_scale: [f64; 3] = [pixel_size_x, pixel_size_y, 0.0];
-        tiff_img
-            .encoder()
-            .write_tag(Tag::Unknown(TAG_MODEL_PIXEL_SCALE), &pixel_scale[..])?;
-
-        // Tiepoint: image (0,0,0) → world (west, north, 0).
-        let tiepoint: [f64; 6] = [0.0, 0.0, 0.0, p.bbox_3857[0], p.bbox_3857[3], 0.0];
-        tiff_img
-            .encoder()
-            .write_tag(Tag::Unknown(TAG_MODEL_TIEPOINT), &tiepoint[..])?;
-
-        // GeoKey Directory: declare CRS = EPSG:3857.
-        // Header (4 u16): KeyDirectoryVersion=1, KeyRevision=1, MinorRevision=1, NumberOfKeys=3.
-        // Then 3 quadruples (KeyID, TIFFTagLocation=0, Count=1, Value).
-        let geokeys: [u16; 4 + 4 * 3] = [
-            1, 1, 1, 3, 1024, 0, 1, 1, // GTModelTypeGeoKey = ModelTypeProjected
-            1025, 0, 1, 1, // GTRasterTypeGeoKey = RasterPixelIsArea
-            3072, 0, 1, 3857, // ProjectedCSTypeGeoKey = EPSG:3857
-        ];
-        tiff_img
-            .encoder()
-            .write_tag(Tag::Unknown(TAG_GEO_KEY_DIRECTORY), &geokeys[..])?;
-
-        tiff_img.write_data(img.as_raw())?;
+        let buf = BufWriter::new(f);
+        if needs_bigtiff {
+            let mut enc = TiffEncoder::new_big(buf)?;
+            write_geo_image(&mut enc, img, p)?;
+        } else {
+            let mut enc = TiffEncoder::new(buf)?;
+            write_geo_image(&mut enc, img, p)?;
+        }
     }
     std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn write_geo_image<W, K>(
+    enc: &mut TiffEncoder<W, K>,
+    img: &RgbaImage,
+    p: &CogParams,
+) -> Result<()>
+where
+    W: std::io::Write + std::io::Seek,
+    K: tiff::encoder::TiffKind,
+{
+    let mut tiff_img = enc.new_image::<colortype::RGBA8>(img.width(), img.height())?;
+
+    let pixel_size_x = (p.bbox_3857[2] - p.bbox_3857[0]) / img.width() as f64;
+    let pixel_size_y = (p.bbox_3857[3] - p.bbox_3857[1]) / img.height() as f64;
+    let pixel_scale: [f64; 3] = [pixel_size_x, pixel_size_y, 0.0];
+    tiff_img
+        .encoder()
+        .write_tag(Tag::Unknown(TAG_MODEL_PIXEL_SCALE), &pixel_scale[..])?;
+
+    let tiepoint: [f64; 6] = [0.0, 0.0, 0.0, p.bbox_3857[0], p.bbox_3857[3], 0.0];
+    tiff_img
+        .encoder()
+        .write_tag(Tag::Unknown(TAG_MODEL_TIEPOINT), &tiepoint[..])?;
+
+    // GeoKey Directory: declare CRS = EPSG:3857.
+    let geokeys: [u16; 4 + 4 * 3] = [
+        1, 1, 1, 3, 1024, 0, 1, 1, // GTModelTypeGeoKey = ModelTypeProjected
+        1025, 0, 1, 1, // GTRasterTypeGeoKey = RasterPixelIsArea
+        3072, 0, 1, 3857, // ProjectedCSTypeGeoKey = EPSG:3857
+    ];
+    tiff_img
+        .encoder()
+        .write_tag(Tag::Unknown(TAG_GEO_KEY_DIRECTORY), &geokeys[..])?;
+
+    tiff_img.write_data(img.as_raw())?;
     Ok(())
 }
 
