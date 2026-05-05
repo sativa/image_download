@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import maplibregl from "maplibre-gl";
   import "maplibre-gl/dist/maplibre-gl.css";
-  import { input } from "../lib/state.svelte";
+  import { input, fitRequest } from "../lib/state.svelte";
   import { previewTileUrl } from "../lib/sources";
   import { parseVectorFile } from "../lib/ipc";
   import { pushToast } from "../lib/state.svelte";
@@ -24,6 +24,10 @@
 
   let container: HTMLDivElement;
   let map: maplibregl.Map | null = null;
+
+  // Live mirrors of the map's current view, updated by MapLibre move/zoom events.
+  let viewZoom = $state(4);
+  let viewCenterLat = $state(35);
 
   let drawing = $state(false);
   let drawStart: maplibregl.LngLat | null = null;
@@ -118,6 +122,16 @@
       zoom: 4,
     });
 
+    // Track view state for the badge — updates live as user pans/zooms.
+    const syncView = () => {
+      if (!map) return;
+      viewZoom = map.getZoom();
+      viewCenterLat = map.getCenter().lat;
+    };
+    syncView();
+    map.on("zoom", syncView);
+    map.on("move", syncView);
+
     // Normalize two LngLat points into proper (sw, ne) regardless of drag direction.
     // MapLibre's LngLatBounds constructor doesn't auto-normalize — passing (NE, SW)
     // gives you a bbox with min > max coordinates and breaks downstream validation.
@@ -169,13 +183,36 @@
     persistBboxLayer(new maplibregl.LngLatBounds([w, s], [e, n]));
   });
 
-  // Live ground-resolution at the current download zoom + bbox center latitude.
-  // Web-mercator pixel size: (40075016.686 * cos(lat)) / (2^z * 256)
-  let metersPerPixel = $derived.by(() => {
+  // Force-fit: triggered after a file import even if the bbox happens to fall
+  // inside the current view. We bump fitRequest.token from InputPanel and
+  // animate here so the user sees the camera move.
+  let lastFitToken = 0;
+  $effect(() => {
+    const t = fitRequest.token;
+    if (!map) return;
+    if (t === lastFitToken) return; // skip mount-time pass and re-runs from other deps
+    lastFitToken = t;
+    const [w, s, e, n] = input.bbox;
+    if (![w, s, e, n].every(Number.isFinite)) return;
+    map.fitBounds([[w, s], [e, n]], { padding: 60, animate: true, duration: 600 });
+    persistBboxLayer(new maplibregl.LngLatBounds([w, s], [e, n]));
+  });
+
+  // Web-mercator ground sample distance at integer or fractional zoom z and latitude lat.
+  // Formula: (Earth_circumference_m * cos(lat)) / (2^z * tile_pixels)
+  function mpp(z: number, lat: number): number {
+    const cos = Math.cos((lat * Math.PI) / 180);
+    return (40075016.686 * Math.abs(cos)) / (Math.pow(2, z) * 256);
+  }
+
+  // What the user sees on the map RIGHT NOW (z and m/px at view center).
+  let viewMpp = $derived(mpp(viewZoom, viewCenterLat));
+
+  // What the download will produce (slider z + bbox center latitude).
+  let downloadMpp = $derived.by(() => {
     const lat = (input.bbox[1] + input.bbox[3]) / 2;
     if (!Number.isFinite(lat)) return null;
-    const cos = Math.cos((lat * Math.PI) / 180);
-    return (40075016.686 * Math.abs(cos)) / (Math.pow(2, input.zoom) * 256);
+    return mpp(input.zoom, lat);
   });
 
   function fmtMpp(m: number): string {
@@ -200,9 +237,16 @@
     {/if}
   </div>
   <div class="zoom-badge">
-    <strong>z{input.zoom}</strong>
-    {#if metersPerPixel !== null}
-      <span>· {fmtMpp(metersPerPixel)}</span>
+    <div class="row">
+      <span class="label">view</span>
+      <span>z{viewZoom.toFixed(1)} · {fmtMpp(viewMpp)}</span>
+    </div>
+    {#if downloadMpp !== null}
+      <div class="row dl">
+        <span class="label">dl</span>
+        <strong>z{input.zoom}</strong>
+        <span>· {fmtMpp(downloadMpp)}</span>
+      </div>
     {/if}
   </div>
   {#if dragOver}
@@ -227,13 +271,25 @@
     z-index: 10;
     background: rgba(0, 0, 0, 0.65);
     color: white;
-    padding: 0.35rem 0.7rem;
+    padding: 0.4rem 0.7rem;
     border-radius: 6px;
-    font-size: 0.85rem;
+    font-size: 0.8rem;
     font-family: ui-monospace, Menlo, monospace;
     pointer-events: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    line-height: 1.2;
   }
-  .zoom-badge strong { color: #4fb0ff; font-weight: 600; }
+  .zoom-badge .row { display: flex; gap: 0.4rem; align-items: baseline; }
+  .zoom-badge .label {
+    color: #9aa0a6;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    width: 2.2em;
+  }
+  .zoom-badge .dl strong { color: #4fb0ff; font-weight: 600; }
   .drop-overlay {
     position: absolute;
     inset: 0;
