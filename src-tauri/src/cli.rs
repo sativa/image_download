@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::core::cog::{bbox_3857_from_range, crop_to_user_bbox, write_cog, CogParams};
+use crate::core::cog::{bbox_3857_from_range, crop_to_user_bbox, write_cog, Compression, CogParams};
 use crate::core::downloader::{download_all, DownloadConfig};
 use crate::core::sources::{pick_auto, SourceKind};
 use crate::core::stitcher::stitch_rgba;
@@ -94,6 +94,23 @@ struct BatchArgs {
     concurrency: usize,
     /// Per-tile network retries (matches GUI default of 3).
     retry_per_tile: u32,
+    /// "jpeg" | "deflate" | "none" — output GeoTIFF compression.
+    compress: String,
+    /// JPEG quality 1..=100 (only used when compress=jpeg).
+    quality: u8,
+}
+
+impl BatchArgs {
+    /// Resolve the validated `--compress`/`--quality` flags into a [`Compression`].
+    fn compression(&self) -> Compression {
+        match self.compress.as_str() {
+            "deflate" => Compression::Deflate,
+            "none" => Compression::None,
+            _ => Compression::Jpeg {
+                quality: self.quality,
+            },
+        }
+    }
 }
 
 /// True when argv looks like a batch invocation (`<prog> batch ...`).
@@ -108,7 +125,7 @@ imagery-downloader batch — headless bulk tile download
 USAGE:
     imagery-downloader batch --regions <regions.json> --out <dir> \\
         [--source esri|google|auto] [--zoom <8-23>] [--concurrency <N>] \\
-        [--retry-per-tile <N>]
+        [--retry-per-tile <N>] [--compress jpeg|deflate|none] [--quality <1-100>]
 
 OPTIONS:
     --regions <PATH>     JSON: array of cells, or {train:[...],test:[...]}.
@@ -118,6 +135,10 @@ OPTIONS:
     --zoom <Z>           XYZ zoom level 8..23    [default: 17  (~1 m/px)]
     --concurrency <N>    Parallel tile fetches per cell [default: 16]
     --retry-per-tile <N> Network retries per tile  [default: 3]
+    --compress <C>       jpeg (lossy YCbCr, 3-band, ~10x) | deflate (lossless,
+                         3-band, ~2x) | none (uncompressed RGBA 4-band)
+                         [default: jpeg]
+    --quality <Q>        JPEG quality 1..100 (compress=jpeg only) [default: 95]
     -h, --help           Show this help.
 
 Output: one EPSG:3857 GeoTIFF per cell, named
@@ -132,6 +153,8 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
     let mut zoom: u32 = 17;
     let mut concurrency: usize = 16;
     let mut retry_per_tile: u32 = 3;
+    let mut compress = "jpeg".to_string();
+    let mut quality: u8 = 95;
 
     // Grab the value following the flag at index `i`, advancing `i` past it.
     fn value_at(argv: &[String], i: &mut usize, name: &str) -> Result<String, String> {
@@ -163,6 +186,12 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
                     .parse()
                     .map_err(|_| "--retry-per-tile must be an integer".to_string())?
             }
+            "--compress" => compress = value_at(argv, &mut i, "--compress")?,
+            "--quality" => {
+                quality = value_at(argv, &mut i, "--quality")?
+                    .parse()
+                    .map_err(|_| "--quality must be an integer".to_string())?
+            }
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
         }
         i += 1;
@@ -180,6 +209,13 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
         "esri" | "google" | "auto" => {}
         other => return Err(format!("--source must be esri|google|auto, got {other}")),
     }
+    match compress.as_str() {
+        "jpeg" | "deflate" | "none" => {}
+        other => return Err(format!("--compress must be jpeg|deflate|none, got {other}")),
+    }
+    if !(1..=100).contains(&quality) {
+        return Err(format!("--quality {quality} out of range 1..=100"));
+    }
     Ok(BatchArgs {
         regions,
         out,
@@ -187,6 +223,8 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
         zoom,
         concurrency,
         retry_per_tile,
+        compress,
+        quality,
     })
 }
 
@@ -267,12 +305,19 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
         return 1;
     }
 
+    let compression = args.compression();
     eprintln!(
-        "[batch] {} cells | source={} | zoom={} | concurrency={} | out={}",
+        "[batch] {} cells | source={} | zoom={} | concurrency={} | compress={}{} | out={}",
         regions.len(),
         source.as_str(),
         args.zoom,
         args.concurrency,
+        args.compress,
+        if args.compress == "jpeg" {
+            format!(" q{}", args.quality)
+        } else {
+            String::new()
+        },
         args.out.display(),
     );
 
@@ -289,8 +334,16 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
             regions.len(),
             out_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         );
-        match download_one_cell(region, source, args.zoom, args.concurrency, args.retry_per_tile, &out_path)
-            .await
+        match download_one_cell(
+            region,
+            source,
+            args.zoom,
+            args.concurrency,
+            args.retry_per_tile,
+            compression,
+            &out_path,
+        )
+        .await
         {
             CellResult::Wrote => {
                 wrote += 1;
@@ -340,6 +393,7 @@ async fn download_one_cell(
     zoom: u32,
     concurrency: usize,
     retry_per_tile: u32,
+    compression: Compression,
     out_path: &Path,
 ) -> CellResult {
     if out_path.exists() {
@@ -389,7 +443,7 @@ async fn download_one_cell(
     let outer_3857 = bbox_3857_from_range(range);
     let (img, bbox_3857) = crop_to_user_bbox(img, outer_3857, bbox);
 
-    match write_cog(&img, &CogParams { bbox_3857, zoom }, out_path) {
+    match write_cog(&img, &CogParams { bbox_3857, zoom }, compression, out_path) {
         Ok(()) => CellResult::Wrote,
         Err(e) => {
             eprintln!(

@@ -1,5 +1,5 @@
 use image::{ImageBuffer, Rgba};
-use imagery_downloader_lib::core::cog::{write_cog, write_preview_png, CogParams};
+use imagery_downloader_lib::core::cog::{write_cog, write_preview_png, Compression, CogParams};
 use tempfile::tempdir;
 use tiff::decoder::Decoder;
 use tiff::tags::Tag;
@@ -15,6 +15,7 @@ fn write_cog_writes_a_readable_tiff() {
             bbox_3857: [0.0, 0.0, 1024.0, 512.0],
             zoom: 5,
         },
+        Compression::None,
         &p,
     )
     .unwrap();
@@ -36,6 +37,7 @@ fn cog_carries_geotiff_tags() {
             bbox_3857: [0.0, 0.0, 100.0, 100.0],
             zoom: 5,
         },
+        Compression::None,
         &p,
     )
     .unwrap();

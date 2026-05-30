@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use image::ImageEncoder;
 use imagery_downloader_lib::core::{
-    cog::{bbox_3857_from_range, write_cog, CogParams},
+    cog::{bbox_3857_from_range, write_cog, Compression, CogParams},
     downloader::DownloadedTile,
     stitcher::stitch_rgba,
     tiles::{range_for_bbox, TileCoord},
@@ -54,7 +54,7 @@ fn pipeline_geojson_to_cog() {
     let dir = tempdir().unwrap();
     let out = dir.path().join("e2e.tif");
     let bbox_3857 = bbox_3857_from_range(range);
-    write_cog(&img, &CogParams { bbox_3857, zoom: 8 }, &out).unwrap();
+    write_cog(&img, &CogParams { bbox_3857, zoom: 8 }, Compression::None, &out).unwrap();
 
     // 6. Read back via tiff crate, verify dimensions + tag presence
     let f = std::fs::File::open(&out).unwrap();

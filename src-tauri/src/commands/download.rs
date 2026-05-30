@@ -3,7 +3,7 @@
 
 use crate::commands::history::record;
 use crate::commands::runner::Runner;
-use crate::core::cog::{bbox_3857_from_range, write_cog, write_preview_png, CogParams};
+use crate::core::cog::{bbox_3857_from_range, write_cog, write_preview_png, Compression, CogParams};
 use crate::core::downloader::{download_all_with_sink, DownloadConfig, DownloadedTile, ProgressUpdate};
 use crate::core::history::HistoryEntry;
 use crate::core::job::Job;
@@ -445,6 +445,9 @@ async fn run_pipeline(
             bbox_3857,
             zoom: args.zoom,
         },
+        // GUI keeps uncompressed RGBA (exact legacy output); the compressed
+        // formats are exposed through the headless `batch` CLI.
+        Compression::None,
         &out_path,
     ) {
         // NB: do NOT clear job state on COG failure — keeping the cache lets
