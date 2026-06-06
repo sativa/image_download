@@ -446,3 +446,13 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
   parcel_dist.pt) + backend match + is_trained。权重 dino_v3_bdd→Mac。
 - **验证(榆中 620123_504 tif, cuda):** stage流完整, done 含 label_parquet, 406地块/7类。GUI/CLI: `--backend parcel_dist`。
   (前端模型下拉加 parcel_dist 选项=待办 UI 小改。)
+
+**[2026-06-07] ① 榆中连续区域全图(下载器→parcel_dist→GeoParquet):** 下载器 batch 下榆中县城+农田连续 5×5 网格
+(620123c, z17 esri, ~12×12km, 25 cell 密铺, 167s) → cell-wise dino_parcel_export --tif-dir(google缺则dup esri)
+→ **连续 GeoParquet 13519 地块**(耕地9428/水体1091/建筑930/草地883/林地657/园地529)。
+- **单大图路线弃:** rasterio.merge 25 tif → 10254×10350 单图 → parcel_dist,但 watershed+CC on 1.06亿像素单核 >34min 太慢。
+  改 cell-wise(各 cell Hann 融合无 tile 接缝,密铺连续,仅 cell 共享边轻微痕)。
+- 预览 yuzhong_continuous_preview.png: 县城红+农田绿+河蓝+山林深绿,连续覆盖。产品 sidecar/yuzhong_product/
+  yuzhong_continuous_region.parquet。脚本 merge_yz.py/plot_yz_cont.py。
+- **教训:** 大区域连续 delineation 用 cell-wise(GPU推理快+Hann无tile接缝) 优于单巨图(CPU watershed 1亿像素瓶颈);
+  cell 边痕可后处理 dissolve。
