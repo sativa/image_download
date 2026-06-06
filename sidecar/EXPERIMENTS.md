@@ -426,3 +426,14 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
 - 实现: dino_parcel_export.py 加 `--tif-dir`(本地esri+google tif→x6,load_tif_pair,3857→4326)/`--prefix`(整县glob)/
   `--region-out`(合并区域GeoParquet)/`--parquet-only`。产品 .250 results/yuzhong_{c1m,tif}_region.parquet +
   Mac sidecar/yuzhong_product/。
+
+**[2026-06-06] 榆中县三项收尾分析:**
+- **③ 县级对象级精度(95 cell vs DLTB 620123,dist-peak最优 md20/pt0.4/ma200):** area-match **90.6%(超FSDA 89.8%)**、
+  boundary-F1 0.286、instance-F1 0.058、over-seg 1.91。真实县级产品精度确认(榆中含黄土山地+城镇,比甘肃混合test 98% 略低
+  但仍超FSDA)。
+- **② 两路线空间一致性:** 逐cell耕地面积相关 **r=1.000**(完美线性一致);全县 cropland 148(1m) vs 145(2m) km²(差2%)、
+  各类分布一致(草地70/74、建筑62/61、林地19/21);公共80cell耕地+园地2m比1m偏大~23%(2m地块标定偏大的分辨率效应)。
+  → dist-peak 对影像源稳健。
+- **① 区域预览** yuzhong_preview.png(两路线视觉一致,采样cell分布同、分类格局同)。
+- **注:** c_1m 榆中=95个采样2km cell(~380km²采样点)非连续全县(3300km²);连续全县需下载器下全县瓦片。
+  脚本 yuzhong_analysis.py/verify_yz.py。
