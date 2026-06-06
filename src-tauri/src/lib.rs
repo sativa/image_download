@@ -23,6 +23,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(commands::runner::Runner::default())
+        .manage(commands::classify::ClassifyRunner::default())
         .invoke_handler(tauri::generate_handler![
             commands::download::estimate_output,
             commands::download::start_download,
@@ -32,6 +33,9 @@ pub fn run() {
             commands::vector::parse_vector_file,
             commands::history::list_history,
             commands::history::clear_history,
+            commands::classify::start_classify,
+            commands::classify::cancel_classify,
+            commands::classify::resolve_history_tif,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

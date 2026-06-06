@@ -38,3 +38,17 @@ out/
 *.tif
 *.tif.tmp
 download_summary.json
+
+# large products / cross-domain data / temp download configs (results live on disk, not git)
+sidecar/parcel_product_demo/
+sidecar/parcel_product*/
+sidecar/figures/
+/c_1m_tibet/
+/c_1m_tibet_pbound/
+/rare_*.json
+/terrace*.json
+/tibet_*.json
+/z17_*.json
+/z18_*.json
+/*_chunk*.json
+/*_regions.json

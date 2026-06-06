@@ -55,6 +55,52 @@ export const toasts = $state<{ items: { id: string; level: "info" | "warn" | "er
   items: [],
 });
 
+// Active landform classification overlay. Set by HistoryPanel when a
+// classify run completes successfully; cleared by the user via the
+// MapPanel "remove overlay" control. MapPanel watches this and adds /
+// updates a MapLibre image source so the colored landform raster sits
+// on top of the downloaded imagery.
+//
+// `bbox` is the source download's WGS84 bbox — we trust it instead of
+// re-reading the GeoTIFF's CRS, because the COG was already written in
+// EPSG:3857 from this same bbox.
+export const landformOverlay = $state<{
+  /** WGS84 GeoJSON path; MapPanel fetches and renders as fill layer. */
+  geojsonPath: string | null;
+  /** Camera fit hint — derived from the actual GPKG bbox so the map can
+   *  pan even before the GeoJSON FeatureCollection loads. */
+  bbox: Bbox | null;
+  classifyId: string | null;
+  /** Toggle for the map layer — true: drawn, false: hidden but kept in
+   *  state so the user can re-show without re-running. Clear() resets
+   *  the source entirely. */
+  visible: boolean;
+}>({
+  geojsonPath: null,
+  bbox: null,
+  classifyId: null,
+  visible: true,
+});
+
+export function setLandformOverlay(geojsonPath: string, bbox: Bbox, classifyId: string): void {
+  landformOverlay.geojsonPath = geojsonPath;
+  landformOverlay.bbox = bbox;
+  landformOverlay.classifyId = classifyId;
+  landformOverlay.visible = true;
+}
+
+export function toggleLandformOverlay(): void {
+  if (!landformOverlay.geojsonPath) return;
+  landformOverlay.visible = !landformOverlay.visible;
+}
+
+export function clearLandformOverlay(): void {
+  landformOverlay.geojsonPath = null;
+  landformOverlay.bbox = null;
+  landformOverlay.classifyId = null;
+  landformOverlay.visible = true;
+}
+
 export function pushToast(level: "info" | "warn" | "error", text: string): void {
   const id = crypto.randomUUID();
   toasts.items = [...toasts.items, { id, level, text }];

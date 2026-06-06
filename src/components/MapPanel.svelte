@@ -2,7 +2,11 @@
   import { onMount, onDestroy } from "svelte";
   import maplibregl from "maplibre-gl";
   import "maplibre-gl/dist/maplibre-gl.css";
-  import { input, fitRequest } from "../lib/state.svelte";
+  import { convertFileSrc } from "@tauri-apps/api/core";
+  import {
+    input, fitRequest, landformOverlay,
+    clearLandformOverlay, toggleLandformOverlay,
+  } from "../lib/state.svelte";
   import { previewTileUrl } from "../lib/sources";
   import { parseVectorFile } from "../lib/ipc";
   import { pushToast } from "../lib/state.svelte";
@@ -198,6 +202,92 @@
     persistBboxLayer(new maplibregl.LngLatBounds([w, s], [e, n]));
   });
 
+  // ── Landform overlay (vector) ────────────────────────────────────────
+  // Renders the GPKG-derived WGS84 GeoJSON as a fill layer above the
+  // imagery. Each feature carries `rgb_hex` so we drive `fill-color`
+  // off feature properties — no need to hard-code the palette here, the
+  // sidecar's prompts.py is the single source of truth for colours.
+  //
+  // Why fetch the GeoJSON in JS (vs. passing it inline through the
+  // event payload)? Because typical classifications produce hundreds of
+  // KB of polygon coordinates; pushing that through IPC then through
+  // Svelte's reactivity system stalls the UI thread for ~100 ms each
+  // time. Loading it once via the asset protocol is straightforward
+  // and the MapLibre source streams the parse off-thread.
+  const OVERLAY_SOURCE_ID = "landform-overlay";
+  const OVERLAY_FILL_LAYER_ID = "landform-overlay-fill";
+  const OVERLAY_LINE_LAYER_ID = "landform-overlay-line";
+
+  async function loadLandformGeoJson(path: string): Promise<GeoJSON.FeatureCollection> {
+    // Cache-buster keeps webviews from serving a stale FeatureCollection
+    // when the user re-classifies the same TIF.
+    const url = `${convertFileSrc(path)}?v=${Date.now()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`overlay fetch ${resp.status}: ${path}`);
+    return await resp.json();
+  }
+
+  $effect(() => {
+    if (!map) return;
+    const path = landformOverlay.geojsonPath;
+    const bbox = landformOverlay.bbox;
+    if (!path || !bbox) {
+      if (map.getLayer(OVERLAY_FILL_LAYER_ID)) map.removeLayer(OVERLAY_FILL_LAYER_ID);
+      if (map.getLayer(OVERLAY_LINE_LAYER_ID)) map.removeLayer(OVERLAY_LINE_LAYER_ID);
+      if (map.getSource(OVERLAY_SOURCE_ID)) map.removeSource(OVERLAY_SOURCE_ID);
+      return;
+    }
+    const [w, s, e, n] = bbox;
+    // Fit immediately on the cached bbox; the GeoJSON might still be
+    // fetching but the camera doesn't need to wait.
+    map.fitBounds([[w, s], [e, n]], { padding: 60, animate: true, duration: 600 });
+
+    void loadLandformGeoJson(path).then((fc) => {
+      if (!map) return;
+      const existing = map.getSource(OVERLAY_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+      if (existing) {
+        existing.setData(fc);
+        return;
+      }
+      map.addSource(OVERLAY_SOURCE_ID, { type: "geojson", data: fc });
+      map.addLayer({
+        id: OVERLAY_FILL_LAYER_ID,
+        type: "fill",
+        source: OVERLAY_SOURCE_ID,
+        layout: { visibility: landformOverlay.visible ? "visible" : "none" },
+        paint: {
+          "fill-color": ["coalesce", ["get", "rgb_hex"], "#888888"],
+          "fill-opacity": 0.55,
+        },
+      });
+      map.addLayer({
+        id: OVERLAY_LINE_LAYER_ID,
+        type: "line",
+        source: OVERLAY_SOURCE_ID,
+        layout: { visibility: landformOverlay.visible ? "visible" : "none" },
+        paint: {
+          "line-color": ["coalesce", ["get", "rgb_hex"], "#444444"],
+          "line-width": 1,
+          "line-opacity": 0.9,
+        },
+      });
+    }).catch((err) => {
+      pushToast("error", `Overlay load failed: ${err}`);
+    });
+  });
+
+  // Visibility toggle: changes only the layout property; no refetch.
+  $effect(() => {
+    if (!map) return;
+    const vis = landformOverlay.visible ? "visible" : "none";
+    if (map.getLayer(OVERLAY_FILL_LAYER_ID)) {
+      map.setLayoutProperty(OVERLAY_FILL_LAYER_ID, "visibility", vis);
+    }
+    if (map.getLayer(OVERLAY_LINE_LAYER_ID)) {
+      map.setLayoutProperty(OVERLAY_LINE_LAYER_ID, "visibility", vis);
+    }
+  });
+
   // Web-mercator ground sample distance at integer or fractional zoom z and latitude lat.
   // Formula: (Earth_circumference_m * cos(lat)) / (2^z * tile_pixels)
   function mpp(z: number, lat: number): number {
@@ -234,6 +324,22 @@
       <button onclick={disableDraw}>Cancel draw</button>
     {:else}
       <button onclick={enableDraw}>Draw rectangle</button>
+    {/if}
+    {#if landformOverlay.geojsonPath}
+      <button
+        class="overlay-btn"
+        onclick={toggleLandformOverlay}
+        title={landformOverlay.visible ? "Hide the landform overlay (kept for re-show)" : "Show the landform overlay"}
+      >
+        {landformOverlay.visible ? "Hide landform" : "Show landform"}
+      </button>
+      <button
+        class="overlay-btn"
+        onclick={clearLandformOverlay}
+        title="Discard the overlay entirely"
+      >
+        Clear
+      </button>
     {/if}
   </div>
   <div class="zoom-badge">

@@ -4,6 +4,7 @@ import type {
   Bbox, Source, EstimateOutput, StartDownloadArgs,
   ProgressEvent, TileFailedEvent, StageEvent, DoneEvent,
   HistoryEntry, ParseVectorFileOk,
+  StartClassifyArgs, LandformStageEvent, LandformProgressEvent, LandformDoneEvent,
 } from "./types";
 
 // True only inside the actual Tauri webview. In `pnpm dev` (browser preview)
@@ -75,4 +76,39 @@ export function onDone(cb: (e: DoneEvent) => void): Promise<UnlistenFn> {
   void cb;
   if (!HAS_TAURI) return Promise.resolve(noopUnlisten);
   return listen<DoneEvent>("download://done", (e) => cb(e.payload));
+}
+
+// ── Landform classification IPC ─────────────────────────────────────────
+
+export function startClassify(args: StartClassifyArgs): Promise<{ classify_id: string }> {
+  if (!HAS_TAURI) return Promise.reject(noTauriError("start_classify"));
+  return invoke("start_classify", { args });
+}
+
+export function cancelClassify(classifyId: string): Promise<boolean> {
+  if (!HAS_TAURI) return Promise.reject(noTauriError("cancel_classify"));
+  return invoke("cancel_classify", { classifyId });
+}
+
+export function resolveHistoryTif(outputPath: string, zoom: number, source: string): Promise<string | null> {
+  if (!HAS_TAURI) return Promise.resolve(null);
+  return invoke("resolve_history_tif", { outputPath, zoom, source });
+}
+
+export function onLandformStage(cb: (e: LandformStageEvent) => void): Promise<UnlistenFn> {
+  void cb;
+  if (!HAS_TAURI) return Promise.resolve(noopUnlisten);
+  return listen<LandformStageEvent>("landform://stage", (e) => cb(e.payload));
+}
+
+export function onLandformProgress(cb: (e: LandformProgressEvent) => void): Promise<UnlistenFn> {
+  void cb;
+  if (!HAS_TAURI) return Promise.resolve(noopUnlisten);
+  return listen<LandformProgressEvent>("landform://progress", (e) => cb(e.payload));
+}
+
+export function onLandformDone(cb: (e: LandformDoneEvent) => void): Promise<UnlistenFn> {
+  void cb;
+  if (!HAS_TAURI) return Promise.resolve(noopUnlisten);
+  return listen<LandformDoneEvent>("landform://done", (e) => cb(e.payload));
 }

@@ -102,3 +102,46 @@ export interface HistoryEntry {
   completed_tiles: number;
   status: HistoryStatus;
 }
+
+// ── Landform classification ─────────────────────────────────────────────
+
+export interface StartClassifyArgs {
+  input_path: string;
+  output_dir?: string | null;
+  device?: "auto" | "cpu" | "mps" | "cuda" | null;
+  /** SAM 3 confidence threshold. Lower = more detections, more noise. */
+  confidence?: number | null;
+  /** Model/backend: cropland (binary) | parcel (SAM3 per-parcel) | landcover (7-class) | sam3/dino/slic (legacy). */
+  backend?: string | null;
+}
+
+export interface LandformStageEvent {
+  classify_id: string;
+  stage: string;
+}
+
+export interface LandformProgressEvent {
+  classify_id: string;
+  done: number;
+  total: number;
+  current_prompt?: string | null;
+}
+
+export type LandformDoneEvent =
+  | {
+      classify_id: string;
+      ok: true;
+      /** Canonical product: GeoPackage in EPSG:3857. */
+      label_gpkg: string;
+      /** Display product: same polygons reprojected to WGS84 GeoJSON.
+       *  MapLibre fetches this and renders as a fill layer; the GPKG is
+       *  the file the user keeps for downstream analysis. */
+      overlay_geojson: string;
+      legend_json: string;
+      /** [W, S, E, N] WGS84 — for fitting the camera before the
+       *  GeoJSON FeatureCollection finishes loading. */
+      overlay_bbox_wgs84: Bbox | null;
+      duration_sec: number;
+      stats: Record<string, { pixels: number; area_pct: number }>;
+    }
+  | { classify_id: string; ok: false; error: string };

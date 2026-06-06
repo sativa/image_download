@@ -4,6 +4,7 @@
 //! plain outputs. Plan B's commands/ wraps them.
 
 pub mod cog;
+pub mod coverage;
 pub mod downloader;
 pub mod history;
 pub mod job;

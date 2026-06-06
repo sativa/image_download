@@ -3,7 +3,10 @@
 
 use crate::commands::history::record;
 use crate::commands::runner::Runner;
-use crate::core::cog::{bbox_3857_from_range, write_cog, write_preview_png, Compression, CogParams};
+use crate::core::cog::{
+    bbox_3857_from_range, crop_to_user_bbox, write_cog, write_preview_png, Compression, CogParams,
+};
+use crate::core::coverage::{probe_coverage, MIN_COVERAGE_TO_PROCEED};
 use crate::core::downloader::{download_all_with_sink, DownloadConfig, DownloadedTile, ProgressUpdate};
 use crate::core::history::HistoryEntry;
 use crate::core::job::Job;
@@ -159,6 +162,54 @@ async fn run_pipeline(
     token: tokio_util::sync::CancellationToken,
 ) {
     let start = Instant::now();
+
+    let range = range_for_bbox(args.bbox, args.zoom);
+    let coords: Vec<_> = range.iter().collect();
+    let total = coords.len() as u32;
+
+    // ── Pre-flight coverage probe ────────────────────────────────────────
+    // Bail out early when the source returns placeholder tiles for most of
+    // the bbox (e.g. Esri at z20 over an area it doesn't have imagery for).
+    // Saves the user from waiting on a multi-thousand-tile job that would
+    // stitch into a uniform-grey COG. ~9 sample requests, finishes in ~1 s.
+    let _ = app.emit(
+        "download://stage",
+        StageEvent {
+            download_id: id.clone(),
+            stage: "probing_coverage".into(),
+        },
+    );
+    match probe_coverage(range, source).await {
+        Ok(report) if report.coverage_ratio < MIN_COVERAGE_TO_PROCEED => {
+            let pct = (report.coverage_ratio * 100.0).round() as u32;
+            let _ = app.emit(
+                "download://done",
+                DoneEvent::Err {
+                    download_id: id.clone(),
+                    ok: false,
+                    error: format!(
+                        "no imagery from {} at zoom {} for this area \
+                         (sampled {} tiles, {} placeholder, {}% coverage) — \
+                         try a lower zoom or switch sources",
+                        source.as_str(),
+                        args.zoom,
+                        report.sampled,
+                        report.placeholder,
+                        pct,
+                    ),
+                },
+            );
+            return;
+        }
+        Ok(_) => { /* coverage acceptable, proceed */ }
+        Err(e) => {
+            // Probe itself crashed (e.g. client builder). Log and continue —
+            // the real download has its own retry/error path and shouldn't
+            // be blocked by an issue inside the optimisation.
+            log::warn!("coverage probe failed; proceeding without guard: {e}");
+        }
+    }
+
     let _ = app.emit(
         "download://stage",
         StageEvent {
@@ -166,10 +217,6 @@ async fn run_pipeline(
             stage: "downloading".into(),
         },
     );
-
-    let range = range_for_bbox(args.bbox, args.zoom);
-    let coords: Vec<_> = range.iter().collect();
-    let total = coords.len() as u32;
 
     // ── Resume support ───────────────────────────────────────────────────
     // Open or create a Job in the user-chosen output folder. The Job stem
@@ -437,7 +484,12 @@ async fn run_pipeline(
             stage: "writing_cog".into(),
         },
     );
-    let bbox_3857 = bbox_3857_from_range(range);
+    let outer_3857 = bbox_3857_from_range(range);
+    // XYZ tiles are downloaded on whole-tile boundaries, so the stitched
+    // image typically overshoots the user's bbox by up to one tile on
+    // each side. Crop back to the user's exact selection before writing
+    // the COG — keeps the on-disk extent faithful to what the user drew.
+    let (img, bbox_3857) = crop_to_user_bbox(img, outer_3857, args.bbox);
     let out_path = job.output_tif_path();
     if let Err(e) = write_cog(
         &img,
