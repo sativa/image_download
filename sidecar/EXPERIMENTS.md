@@ -415,3 +415,14 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
 - **梯田+耕地案例批次:** 梯田 c_1m_terrace(2000 cell,黄土高原等高线梯田)→ parcel_product_terrace(4 cell,梯田正确
   识别为耕地+村庄红+渠蓝,边界跟等高线条带无方块);耕地密集 c_1m_lc top(620724_595耕地811/620721_313耕地853/
   624001_351/620421_486)→ parcel_product_cropland。共12 cell 产品在 Mac sidecar/parcel_product_demo/。
+
+**[2026-06-06] 榆中县(620123)整体分析 — 两影像路线 → GeoParquet:** 用最优 dist-peak 模型(dino_v3_bdd,Hann融合)
+对榆中全县逐地块分析,两条影像路线对比:
+- **路线1 下载影像 c_1m(~1m,95 cell):** 55278 地块, 耕地+园地 39287块/155.1 km², 全类 316.2 km²。
+- **路线2 本地影像 hires_jpg(~2m,80 cell,esri+google tif):** 41616 地块, 耕地+园地 29191块/151.4 km², 全类 316.9 km²。
+- **关键: 两路线耕地面积高度一致(155.1 vs 151.4 km², 差2.4%)/全类面积一致(316 km²)**, 尽管影像源/分辨率/cell数不同
+  → **dist-peak 模型对影像源稳健(交叉验证)**; 1m 比 2m 地块更细(55278 vs 41616)。GeoParquet(EPSG:4326,
+  列 gid/parcel_id/class_id/label/label_en/rgb_hex/area_m2/cell)。
+- 实现: dino_parcel_export.py 加 `--tif-dir`(本地esri+google tif→x6,load_tif_pair,3857→4326)/`--prefix`(整县glob)/
+  `--region-out`(合并区域GeoParquet)/`--parquet-only`。产品 .250 results/yuzhong_{c1m,tif}_region.parquet +
+  Mac sidecar/yuzhong_product/。

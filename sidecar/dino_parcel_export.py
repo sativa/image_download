@@ -77,9 +77,11 @@ def export_cell(model, x6, bbox, name, a, out_dir):
         rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
                      "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})
     gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
-    gpkg = out_dir / f"{name}.gpkg"; geojson = out_dir / f"{name}.geojson"
-    gdf.to_file(gpkg, driver="GPKG", layer="parcels")
-    gdf.to_file(geojson, driver="GeoJSON")
+    gdf["cell"] = name
+    gdf.to_parquet(out_dir / f"{name}.parquet")                    # GeoParquet (default storage)
+    if not a.parquet_only:
+        gdf.to_file(out_dir / f"{name}.gpkg", driver="GPKG", layer="parcels")
+        gdf.to_file(out_dir / f"{name}.geojson", driver="GeoJSON")
     # raster + viz
     clsmap = np.zeros((H, W), np.uint8)
     for pid, c in cls_of.items():
@@ -91,7 +93,7 @@ def export_cell(model, x6, bbox, name, a, out_dir):
               "model": "DINOv3-Sat dist-peak watershed (cropland) + 7-class connected-components",
               "n_parcels": len(rows), "stats": {NAME_ZH[k]: v for k, v in cc.items()}}
     (out_dir / f"{name}.legend.json").write_text(json.dumps(legend, indent=2, ensure_ascii=False))
-    return len(rows), {NAME_ZH[k]: v for k, v in sorted(cc.items())}
+    return gdf, len(rows), {NAME_ZH[k]: v for k, v in sorted(cc.items())}
 
 
 def _viz(x6, idmap, clsmap, path, max_side=1100):
@@ -112,8 +114,30 @@ def _viz(x6, idmap, clsmap, path, max_side=1100):
     Image.fromarray(np.concatenate([rgb, gap, clsov, gap, edgeov], 1)).save(path)
 
 
+def load_tif_pair(tif_dir, cell):
+    """Route 2 (local imagery): read {cell}_esri.tif + {cell}_google.tif -> x6 (6,H,W) uint8 + bbox(4326).
+    Google resized to Esri grid if sizes differ; bbox from Esri CRS reprojected to WGS84."""
+    import rasterio
+    from rasterio.warp import transform_bounds
+    tp = Path(tif_dir)
+    with rasterio.open(tp / f"{cell}_esri.tif") as e:
+        re = e.read([1, 2, 3]); crs = e.crs; b = e.bounds; H, W = e.height, e.width
+    gp = tp / f"{cell}_google.tif"
+    if gp.exists():
+        with rasterio.open(gp) as g:
+            rg = g.read([1, 2, 3])
+        if rg.shape[1:] != (H, W):
+            rg = np.stack([cv2.resize(rg[i], (W, H), interpolation=cv2.INTER_LINEAR) for i in range(3)])
+    else:
+        rg = re                                                    # google missing -> duplicate esri
+    x6 = np.concatenate([re, rg], 0).astype(np.uint8)
+    bbox = np.array(transform_bounds(crs, "EPSG:4326", b.left, b.bottom, b.right, b.top), np.float64)
+    return x6, bbox
+
+
 def main():
     import torch
+    import pandas as pd
     from transformers import AutoModel
     from train_dino_1m_v3 import DinoV3FreqUNetBDD, DINOV3_SAT
     ap = argparse.ArgumentParser()
@@ -128,6 +152,10 @@ def main():
     ap.add_argument("--simplify-px", type=float, default=2.0)
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out-dir", default="/mnt/sda/zf/landform/results/parcel_product")
+    ap.add_argument("--prefix", default="", help="glob cells by prefix (e.g. 620123_ for a whole county)")
+    ap.add_argument("--tif-dir", default="", help="route 2: local esri+google tif dir (else npz data-dir)")
+    ap.add_argument("--region-out", default="", help="merge all cells -> one regional GeoParquet")
+    ap.add_argument("--parquet-only", action="store_true", help="skip per-cell gpkg/geojson, keep GeoParquet")
     a = ap.parse_args()
     out_dir = Path(a.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -139,15 +167,37 @@ def main():
     print(f"[export] loaded {a.ckpt} ({time.time()-t0:.0f}s)", flush=True)
     if a.cells:
         cells = a.cells.split(",")
+    elif a.tif_dir:                                                # route 2: pair from *_esri.tif
+        cells = sorted(p.name[:-9] for p in Path(a.tif_dir).glob(f"{a.prefix}*_esri.tif"))
+    elif a.prefix:                                                 # whole county from npz dir
+        cells = sorted(p.stem for p in Path(a.data_dir).glob(f"{a.prefix}*.npz"))
     else:
         manf = Path(a.data_dir) / "manifest.json"
         mm = json.loads(manf.read_text()) if manf.exists() else {}
         pool = mm.get("test") or sorted(p.stem for p in Path(a.data_dir).glob("*.npz"))
         cells = [n for n in pool if (Path(a.data_dir) / f"{n}.npz").exists()][:a.n_cells]
+    if a.n_cells and len(cells) > a.n_cells and not a.cells:
+        cells = cells[:a.n_cells]
+    print(f"[export] {len(cells)} cells | route={'local-tif' if a.tif_dir else 'download-npz'}", flush=True)
+    gdfs = []
     for n in cells:
-        z = np.load(Path(a.data_dir) / f"{n}.npz")
-        npar, stats = export_cell(m, z["x6"], z["bbox"], n, a, out_dir)
-        print(f"  {n}: {npar} parcels  {stats}  -> {n}.geojson/.gpkg/.png", flush=True)
+        try:
+            if a.tif_dir:
+                x6, bbox = load_tif_pair(a.tif_dir, n)
+            else:
+                z = np.load(Path(a.data_dir) / f"{n}.npz"); x6, bbox = z["x6"], z["bbox"]
+            gdf, npar, stats = export_cell(m, x6, bbox, n, a, out_dir)
+            gdfs.append(gdf)
+            print(f"  {n}: {npar} parcels  {stats}", flush=True)
+        except Exception as ex:
+            print(f"  {n}: FAILED {ex}", flush=True)
+    if a.region_out and gdfs:
+        reg = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs="EPSG:4326")
+        reg.insert(0, "gid", range(1, len(reg) + 1))               # global region id
+        reg.to_parquet(a.region_out)
+        from collections import Counter
+        cc = Counter(reg["label"])
+        print(f"[region] {len(reg)} parcels -> {a.region_out}  {dict(cc)}", flush=True)
     print(f"[export] done -> {out_dir} ({time.time()-t0:.0f}s)", flush=True)
 
 
