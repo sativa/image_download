@@ -42,9 +42,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--confidence", type=float, default=0.4,
                    help="SAM 3 confidence threshold passed to the processor.")
     p.add_argument("--backend", default="cropland",
-                   choices=("cropland", "parcel_bh", "parcel", "landcover", "sam3", "dino", "slic"),
-                   help="cropland=binary cropland (DEFAULT); parcel_bh=boundary-head watershed + 8-class "
-                        "(layered per-parcel); parcel=SAM3+cropland; landcover=7-class; sam3/dino/slic=legacy.")
+                   choices=("cropland", "parcel_dist", "parcel_bh", "parcel", "landcover", "sam3", "dino", "slic"),
+                   help="cropland=binary cropland (DEFAULT); parcel_dist=BEST dist-peak watershed + 7-class "
+                        "(GeoParquet); parcel_bh=boundary-head watershed; parcel=SAM3+cropland; "
+                        "landcover=7-class; sam3/dino/slic=legacy.")
     p.add_argument("--backbone-dir", type=Path,
                    default=Path("/Users/zhangfeng/D/cropland_dino/dinov3-vitl16-sat493m"),
                    help="DINOv3-Sat backbone dir (cropland/landcover/parcel backends).")
@@ -57,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     required = [args.input, args.weights]
-    if args.backend in ("cropland", "landcover", "parcel"):
+    if args.backend in ("cropland", "landcover", "parcel", "parcel_dist", "parcel_bh"):
         required.append(args.backbone_dir)
     if args.backend == "parcel":
         required.append(args.sam3_weights)

@@ -437,3 +437,12 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
 - **① 区域预览** yuzhong_preview.png(两路线视觉一致,采样cell分布同、分类格局同)。
 - **注:** c_1m 榆中=95个采样2km cell(~380km²采样点)非连续全县(3300km²);连续全县需下载器下全县瓦片。
   脚本 yuzhong_analysis.py/verify_yz.py。
+
+**[2026-06-07] parcel_dist 部署后端 — 最优 dist-peak 接进 GUI/CLI:** 新后端把最优 delineation 线接入下载器分类:
+- `sam3_classify/parcel_dist.py`: read GeoTIFF → x6(单源dup) → DinoV3FreqUNetBDD 距离头 → infer_heads(Hann融合,无接缝)
+  → build_idmap(dist-peak watershed 耕地 + connected-components 其他类) → 全覆盖7类 → **GeoParquet(默认)+GeoJSON+GPKG+
+  class raster+legend**。
+- infer.py dispatch + __main__ choices 加 `parcel_dist`; classify.rs `default_parcel_dist_weights()`(~/D/cropland_dino/
+  parcel_dist.pt) + backend match + is_trained。权重 dino_v3_bdd→Mac。
+- **验证(榆中 620123_504 tif, cuda):** stage流完整, done 含 label_parquet, 406地块/7类。GUI/CLI: `--backend parcel_dist`。
+  (前端模型下拉加 parcel_dist 选项=待办 UI 小改。)

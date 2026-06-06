@@ -427,6 +427,10 @@ def run(cfg: InferConfig) -> None:
     device = env_patches.apply(cfg.device)
 
     # Trained DINOv3-Sat models with full-coverage polygons (every pixel classified, no gaps).
+    if cfg.backend == "parcel_dist":        # BEST: distance head -> dist-peak watershed (Hann blend) + 7-class
+        from .parcel_dist import run_parcel_dist
+        run_parcel_dist(cfg, device)
+        return
     if cfg.backend == "parcel_bh":          # boundary-head watershed + 8-class head (layered per-parcel)
         from .parcel_bh import run_parcel_bh
         run_parcel_bh(cfg, device)

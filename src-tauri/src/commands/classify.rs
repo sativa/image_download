@@ -149,6 +149,13 @@ fn default_landcover_weights() -> String {
         .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/landcover8_bh.pt".into())
 }
 
+/// DINOv3-Sat 9-class + boundary + DISTANCE head checkpoint (dino_v3_bdd) — the BEST delineation
+/// line used by the `parcel_dist` backend (dist-peak watershed, Hann blend, area-match 98%).
+fn default_parcel_dist_weights() -> String {
+    std::env::var("PARCEL_DIST_WEIGHTS")
+        .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/parcel_dist.pt".into())
+}
+
 /// DINOv3-Sat backbone dir the cropland checkpoint is loaded on top of.
 fn default_backbone_dir() -> String {
     std::env::var("CROPLAND_BACKBONE")
@@ -276,8 +283,10 @@ async fn run_sidecar(
     // Default backend: trained DINOv3-Sat binary cropland model (ready + tested), full-coverage.
     // Switch to "landcover" (7-class per-parcel) once that checkpoint is trained + on disk.
     let backend = args.backend.unwrap_or_else(|| "cropland".into());
-    let is_trained = matches!(backend.as_str(), "landcover" | "cropland" | "parcel" | "parcel_bh");
+    let is_trained = matches!(backend.as_str(), "landcover" | "cropland" | "parcel" | "parcel_bh" | "parcel_dist");
     let weights = match backend.as_str() {
+        // parcel_dist = BEST: distance-head dist-peak watershed (its own 9-class+boundary+distance ckpt).
+        "parcel_dist" => default_parcel_dist_weights(),
         // landcover + parcel_bh both use the 8-class + boundary-head checkpoint.
         "landcover" | "parcel_bh" => default_landcover_weights(),
         // parcel = SAM3 instances + the DINOv3 cropland model (weights = cropland ckpt;
