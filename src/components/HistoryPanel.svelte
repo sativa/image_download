@@ -33,8 +33,9 @@
   // Selected classification model/backend (applies to the next Classify click).
   let classifyBackend = $state("cropland");
   const BACKEND_OPTIONS = [
+    { value: "parcel_dist", label: "逐地块·距离头 7类 (最优·推荐 / GeoParquet)" },
     { value: "cropland", label: "耕地二分类 (快)" },
-    { value: "parcel_bh", label: "逐地块·边界头+8类 (推荐)" },
+    { value: "parcel_bh", label: "逐地块·边界头 8类" },
     { value: "parcel", label: "逐地块 SAM3+耕地 (慢)" },
     { value: "landcover", label: "8类地物 (像素)" },
   ];

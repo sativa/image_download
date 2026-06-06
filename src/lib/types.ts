@@ -111,7 +111,8 @@ export interface StartClassifyArgs {
   device?: "auto" | "cpu" | "mps" | "cuda" | null;
   /** SAM 3 confidence threshold. Lower = more detections, more noise. */
   confidence?: number | null;
-  /** Model/backend: cropland (binary) | parcel (SAM3 per-parcel) | landcover (7-class) | sam3/dino/slic (legacy). */
+  /** Model/backend: parcel_dist (BEST dist-peak watershed 7-class, GeoParquet) | cropland (binary) |
+   *  parcel_bh (boundary-head) | parcel (SAM3 per-parcel) | landcover (7-class) | sam3/dino/slic (legacy). */
   backend?: string | null;
 }
 
