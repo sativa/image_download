@@ -30,6 +30,8 @@ class _Params:
         self.peak_thr = float(getattr(cfg, "peak_thr", 0) or 0.4)
         self.min_area_px = int(getattr(cfg, "min_marker", 0) or 200)
         self.ridge = bool(getattr(cfg, "ridge", False))
+        self.downscale = 1                                         # set per-image in run() (big mosaic -> 4)
+        self.smooth_iters = int(getattr(cfg, "smooth_iters", 2))
 
 
 def run_parcel_dist(cfg, device: str) -> None:
@@ -46,7 +48,7 @@ def run_parcel_dist(cfg, device: str) -> None:
     from train_dino_1m_v3 import DinoV3FreqUNetBDD
     from transformers import AutoModel
     from dino_parcel_eval import infer_heads, dist_peak_instances  # noqa: F401 (dist_peak_instances via build_idmap)
-    from dino_parcel_export import build_idmap, NAME_ZH, NAME_EN, HEX, RGB, CLASSES
+    from dino_parcel_export import build_idmap, smooth_geom, NAME_ZH, NAME_EN, HEX, RGB, CLASSES
 
     _emit({"type": "stage", "stage": "reading_image"})
     rgb, profile, wgs84_bbox = read_rgb_from_geotiff(cfg.input_tif)
@@ -68,7 +70,9 @@ def run_parcel_dist(cfg, device: str) -> None:
     clsprob, dist, bnd = infer_heads(model, x6, dev)               # Hann-blended tiling (no seams)
 
     _emit({"type": "stage", "stage": "delineating_parcels"})
-    idmap, cls_of = build_idmap(clsprob, dist, bnd, _Params(cfg))  # dist-peak cropland + CC others, full coverage
+    params = _Params(cfg)
+    params.downscale = 4 if max(H, W) > 5000 else 1                # big mosaic -> downscaled single-pass watershed (no seams)
+    idmap, cls_of = build_idmap(clsprob, dist, bnd, params)        # dist-peak cropland + CC others, full coverage
 
     _emit({"type": "stage", "stage": "polygonizing"})
     transform = profile["transform"]; crs = profile["crs"]
@@ -85,6 +89,8 @@ def run_parcel_dist(cfg, device: str) -> None:
         if simp > 0:
             gs = g.simplify(simp, preserve_topology=True)
             g = gs if (not gs.is_empty and gs.is_valid) else g
+        if params.smooth_iters > 0:
+            g = smooth_geom(g, params.smooth_iters)                # Chaikin -> smooth curved edges
         area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
         rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
                      "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})

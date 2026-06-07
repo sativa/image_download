@@ -25,32 +25,65 @@ NAME_ZH = {c[0]: c[1] for c in CLASSES}; NAME_EN = {c[0]: c[2] for c in CLASSES}
 RGB = {c[0]: c[3] for c in CLASSES}; HEX = {c[0]: "#%02x%02x%02x" % c[3] for c in CLASSES}
 
 
+def smooth_geom(geom, iters=2):
+    """Chaikin corner-cutting: rasterised parcel edges (pixel staircase) -> smooth curves. Topology-safe."""
+    from shapely.geometry import Polygon, MultiPolygon
+
+    def chaikin(coords):
+        pts = list(coords)
+        if len(pts) < 4:
+            return pts
+        for _ in range(iters):
+            out = []
+            for i in range(len(pts) - 1):
+                p, q = pts[i], pts[i + 1]
+                out.append((0.75 * p[0] + 0.25 * q[0], 0.75 * p[1] + 0.25 * q[1]))
+                out.append((0.25 * p[0] + 0.75 * q[0], 0.25 * p[1] + 0.75 * q[1]))
+            out.append(out[0]); pts = out
+        return pts
+
+    try:
+        if geom.geom_type == "Polygon":
+            g2 = Polygon(chaikin(geom.exterior.coords), [chaikin(r.coords) for r in geom.interiors])
+            return g2 if g2.is_valid else geom
+        if geom.geom_type == "MultiPolygon":
+            mp = MultiPolygon([smooth_geom(p, iters) for p in geom.geoms])
+            return mp if mp.is_valid else geom
+    except Exception:
+        return geom
+    return geom
+
+
 def build_idmap(clsprob, dist, bnd, a):
     """Full-coverage instance id-map: cropland(1,2) via dist-peak watershed; other classes via
     connected components of the per-pixel argmax. Returns (idmap, cls_of)."""
     pix = clsprob[1:].argmax(0) + 1                                # 1..8 per pixel
     for s, d in MERGE.items():
         pix[pix == s] = d                                          # 8->6
-    # cropland/orchard instances (the well-delineated part)
-    inst, n = dist_peak_instances(clsprob, dist, bnd, a.min_dist, a.peak_thr, a.min_area_px, a.ridge)
+    # cropland/orchard instances (the well-delineated part); downscale lets a big mosaic run in one pass
+    inst, n = dist_peak_instances(clsprob, dist, bnd, a.min_dist, a.peak_thr, a.min_area_px,
+                                  a.ridge, getattr(a, "downscale", 1))
     idmap = inst.astype(np.int32); cls_of = {}
-    flat = clsprob[1:].reshape(8, -1)
-    for pid in range(1, n + 1):
-        m = idmap == pid
-        if m.any():
-            cls_of[pid] = int(flat[:, m.ravel()].mean(1).argmax()) + 1   # 1 or 2 (crop/orchard)
+    if n > 0:                                                      # vectorised cls per instance (bincount, no per-pid mask)
+        fid = idmap.ravel()
+        s1 = np.bincount(fid, weights=clsprob[1].ravel().astype(np.float64), minlength=n + 1)
+        s2 = np.bincount(fid, weights=clsprob[2].ravel().astype(np.float64), minlength=n + 1)
+        for pid in range(1, n + 1):
+            cls_of[pid] = 1 if s1[pid] >= s2[pid] else 2           # cropland(1) vs orchard(2)
     nxt = n + 1
     # other land-cover classes: connected components of argmax in still-unassigned pixels
     for c in (3, 4, 5, 6, 7):
         cm = ((idmap == 0) & (pix == c)).astype(np.uint8)
         if not cm.any():
             continue
-        ncc, cc = cv2.connectedComponents(cm, connectivity=8)
+        ncc, cc, stats, _ = cv2.connectedComponentsWithStats(cm, connectivity=8)   # vectorised, no per-label mask scan
+        remap = np.zeros(ncc, np.int32)
         for lab in range(1, ncc):
-            region = cc == lab
-            if int(region.sum()) < a.min_area_px:
-                continue
-            idmap[region] = nxt; cls_of[nxt] = c; nxt += 1
+            if stats[lab, cv2.CC_STAT_AREA] >= a.min_area_px:
+                remap[lab] = nxt; cls_of[nxt] = c; nxt += 1
+        sel = cc > 0
+        gid = remap[cc[sel]]
+        idmap[sel] = np.where(gid > 0, gid, idmap[sel])            # assign whole class in one vectorised step
     return idmap, cls_of
 
 
@@ -71,8 +104,10 @@ def export_cell(model, x6, bbox, name, a, out_dir):
             continue
         g = shape(geom)
         if simp > 0:
-            gs = g.simplify(simp, preserve_topology=True)
+            gs = g.simplify(simp, preserve_topology=True)          # drop pixel-staircase points
             g = gs if (not gs.is_empty and gs.is_valid) else g
+        if getattr(a, "smooth_iters", 2) > 0:
+            g = smooth_geom(g, a.smooth_iters)                     # Chaikin -> smooth curved edges
         area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
         rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
                      "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})
@@ -150,6 +185,8 @@ def main():
     ap.add_argument("--min-area-px", type=int, default=200)
     ap.add_argument("--ridge", action="store_true")
     ap.add_argument("--simplify-px", type=float, default=2.0)
+    ap.add_argument("--downscale", type=int, default=1, help=">1: watershed on /N grid (big mosaic in one pass, no cell seams)")
+    ap.add_argument("--smooth-iters", type=int, default=2, help="Chaikin corner-cutting iterations (0=off)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out-dir", default="/mnt/sda/zf/landform/results/parcel_product")
     ap.add_argument("--prefix", default="", help="glob cells by prefix (e.g. 620123_ for a whole county)")

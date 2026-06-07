@@ -55,23 +55,35 @@ def infer_heads(model, x6, dev, cs=448):
     return acc / cnt, accd / cnt, accb / cnt
 
 
-def dist_peak_instances(clsprob, dist, bnd, min_dist, peak_thr, min_area, use_ridge=False):
+def dist_peak_instances(clsprob, dist, bnd, min_dist, peak_thr, min_area, use_ridge=False, downscale=1):
     """dist-peak watershed within the cropland(argmax∈{1,2}) mask -> instance id-map (relabelled 1..K).
-    use_ridge: flood over a ridge = max(boundary-prob, 1-dist) so the boundary head reinforces edges
-    (watershed barriers at predicted boundaries); else flood over -dist (pure distance basins)."""
+    use_ridge: flood over a ridge = max(boundary-prob, 1-dist) so the boundary head reinforces edges.
+    downscale>1: run the (expensive) watershed on a /downscale grid then NEAREST-upsample the labels —
+    lets a single large mosaic be segmented in one pass (continuous, NO cell seams) in minutes, not >30min."""
     crop = np.isin(clsprob[1:].argmax(0) + 1, [1, 2])              # cropland+orchard pixels
-    coords = peak_local_max(dist * crop, min_distance=min_dist, threshold_abs=peak_thr)
-    markers = np.zeros(dist.shape, np.int32)
+    H, W = dist.shape
+    if downscale > 1:
+        hs, ws = max(1, H // downscale), max(1, W // downscale)
+        dist_w = cv2.resize(dist, (ws, hs), interpolation=cv2.INTER_AREA)
+        crop_w = cv2.resize(crop.astype(np.uint8), (ws, hs), interpolation=cv2.INTER_NEAREST) > 0
+        bnd_w = cv2.resize(bnd, (ws, hs), interpolation=cv2.INTER_AREA)
+        md, ma = max(2, min_dist // downscale), max(4, min_area // (downscale * downscale))
+    else:
+        dist_w, crop_w, bnd_w, md, ma = dist, crop, bnd, min_dist, min_area
+    coords = peak_local_max(dist_w * crop_w, min_distance=md, threshold_abs=peak_thr)
+    markers = np.zeros(dist_w.shape, np.int32)
     for i, (y, x) in enumerate(coords, 1):
         markers[y, x] = i
     if markers.max() == 0:
-        return np.zeros(dist.shape, np.int32), 0
-    elevation = np.maximum(bnd, 1.0 - dist) if use_ridge else (-dist)
-    inst = watershed(elevation, markers, mask=crop)                # flood from peaks to (boundary-reinforced) edges
+        return np.zeros((H, W), np.int32), 0
+    elevation = np.maximum(bnd_w, 1.0 - dist_w) if use_ridge else (-dist_w)
+    inst = watershed(elevation, markers, mask=crop_w)              # flood from peaks to (boundary-reinforced) edges
     cnt = np.bincount(inst.ravel())
-    small = np.nonzero(cnt < min_area)[0]; small = small[small != 0]
+    small = np.nonzero(cnt < ma)[0]; small = small[small != 0]
     if small.size:
         inst[np.isin(inst, small)] = 0
+    if downscale > 1:
+        inst = cv2.resize(inst.astype(np.int32), (W, H), interpolation=cv2.INTER_NEAREST)
     ids = np.unique(inst); ids = ids[ids > 0]
     remap = np.zeros(int(inst.max()) + 1, np.int32) if inst.max() else np.zeros(1, np.int32)
     if ids.size:
@@ -85,6 +97,7 @@ def main():
     ap.add_argument("--data-dir", default="/mnt/sda/zf/landform/data/c_1m_lc")
     ap.add_argument("--dltb", default=str(HOME / "data/v11_dltb"))
     ap.add_argument("--n-cells", type=int, default=120)
+    ap.add_argument("--prefix", default="", help="glob cells by prefix (e.g. 620123_ for whole county eval)")
     ap.add_argument("--min-dist", type=int, default=10, help="peak_local_max min spacing (px)")
     ap.add_argument("--peak-thr", type=float, default=0.3, help="min distance-value for a seed")
     ap.add_argument("--min-area-px", type=int, default=64)
@@ -105,7 +118,9 @@ def main():
 
     manf = Path(a.data_dir) / "manifest.json"
     mm = json.loads(manf.read_text()) if manf.exists() else {}
-    if "test" in mm:
+    if a.prefix:                                                   # whole county / region
+        te = sorted(p.stem for p in Path(a.data_dir).glob(f"{a.prefix}*.npz"))[:a.n_cells]
+    elif "test" in mm:
         te = [n for n in mm["test"] if (Path(a.data_dir) / f"{n}.npz").exists()][:a.n_cells]
     else:                                                          # no test split (e.g. Changzhi) -> all cells
         te = sorted(p.stem for p in Path(a.data_dir).glob("*.npz"))[:a.n_cells]

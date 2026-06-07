@@ -456,3 +456,15 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
   yuzhong_continuous_region.parquet。脚本 merge_yz.py/plot_yz_cont.py。
 - **教训:** 大区域连续 delineation 用 cell-wise(GPU推理快+Hann无tile接缝) 优于单巨图(CPU watershed 1亿像素瓶颈);
   cell 边痕可后处理 dissolve。
+
+**[2026-06-07] 连续大图消 cell 硬接边 + 线条平滑(用户反馈):**
+- **① cell 硬接边 → 单大图统一 watershed:** cell-wise 各 cell 独立 watershed→cell 边截断成硬直线。改用 rasterio.merge
+  拼单大图(10254×10350) → parcel_dist 一次统一 watershed(连续,无 cell 边)。**降采样加速:** dist_peak_instances 加
+  `downscale`(dist/crop/bnd 降 N 倍→watershed→NEAREST 上采样),parcel_dist 大图(max>5000)自动 downscale=4(watershed快~16×)。
+- **② build_idmap O(n×像素)瓶颈 → 全向量化(真正治34min慢):** 耕地 cls_of 原 per-pid `idmap==pid`(数千×1亿)→
+  **bincount 加权**(clsprob[1]/[2] 一次算所有 instance);其他类 CC 原 per-lab `cc==lab`→**connectedComponentsWithStats
+  +向量化赋值**。消除所有 per-instance/per-label 全图 mask 扫描 → delineating 从 >34min 降到几分钟。
+- **③ 线条平滑:** smooth_geom(Chaikin 角点切割,栅格阶梯→平滑曲线,拓扑安全) + Douglas-Peucker 简化。args --downscale
+  /--smooth-iters。
+- **结果:** 榆中连续 ~12×12km 单图,12961 地块,**无 cell 接边、边界平滑、连续全覆盖**(yuzhong_cont2_preview/zoom.png)。
+  parcel_dist 部署后端同步受益(大图自动 downscale+平滑)。
