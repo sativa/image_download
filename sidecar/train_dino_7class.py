@@ -20,17 +20,20 @@ import torch.nn.functional as F
 HOME = Path("/home/ps/landform"); sys.path.insert(0, str(HOME / "sidecar"))
 from train_dino_1m import norm6
 from train_dino_1m_v2 import load_ndvi_full, small_feature_w
-from train_dino_1m_v3 import DinoV3FreqUNet, DinoV3FreqUNetBD, DinoV3FreqUNetBDD, DINOV3_SAT
+from train_dino_1m_v3 import DinoV3FreqUNet, DinoV3FreqUNetBD, DinoV3FreqUNetBDD, DinoV3FreqUNetBDDF, DINOV3_SAT
+from scipy import ndimage as _ndi
+import cv2 as _cv2
 
 NAMES = ["nodata", "耕地", "园地", "林地", "草地", "水体", "建筑", "荒漠", "设施大棚"]
 
 
 class C1mLabel7(torch.utils.data.Dataset):
-    def __init__(self, names, dd, label_dir, crop, training, multitemporal=False, pbound_dir="", dist_dir=""):
+    def __init__(self, names, dd, label_dir, crop, training, multitemporal=False, pbound_dir="", dist_dir="", frame=False):
         self.n = names; self.d = Path(dd); self.ld = Path(label_dir)
         self.c = crop; self.tr = training; self.mt = multitemporal
         self.pb = Path(pbound_dir) if pbound_dir else None
         self.dd = Path(dist_dir) if dist_dir else None
+        self.frame = frame                                         # also yield frame-field GT (û² + edge band)
 
     def __len__(self):
         return len(self.n)
@@ -72,8 +75,21 @@ class C1mLabel7(torch.utils.data.Dataset):
             k = random.randint(0, 3)
             if k:
                 x = np.rot90(x, k, (1, 2)).copy(); lc = np.rot90(lc, k).copy(); bc = np.rot90(bc, k).copy(); dc = np.rot90(dc, k).copy()
+        if self.frame:                                            # frame-field GT from the (augmented) boundary
+            edge = bc > 0.5
+            if edge.any():
+                de = _ndi.distance_transform_edt(~edge).astype(np.float32)
+                gy, gx = np.gradient(de); mag = np.hypot(gx, gy) + 1e-6
+                tx, ty = -gy / mag, gx / mag                       # tangent = edge direction
+                band = _cv2.dilate(edge.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(np.float32)
+                fg = np.stack([tx * tx - ty * ty, 2 * tx * ty, band]).astype(np.float32)   # û²(cos2θ,sin2θ), band
+            else:
+                fg = np.zeros((3, cs, cs), np.float32)
+        else:
+            fg = np.zeros((3, cs, cs), np.float32)
         return (torch.from_numpy(np.ascontiguousarray(x)), torch.from_numpy(np.ascontiguousarray(lc)),
-                torch.from_numpy(np.ascontiguousarray(bc)), torch.from_numpy(np.ascontiguousarray(dc)))
+                torch.from_numpy(np.ascontiguousarray(bc)), torch.from_numpy(np.ascontiguousarray(dc)),
+                torch.from_numpy(np.ascontiguousarray(fg)))
 
 
 @torch.no_grad()
@@ -137,6 +153,8 @@ def main():
     p.add_argument("--boundary-decoder", action="store_true", help="dedicated higher-capacity boundary decoder (DinoV3FreqUNetBD)")
     p.add_argument("--boundary-dice", action="store_true", help="add Dice to the boundary loss (better for sparse edges)")
     p.add_argument("--dist-head", action="store_true", help="add distance-to-boundary head (DinoV3FreqUNetBDD, ResUNet-a/BsiNet recipe)")
+    p.add_argument("--frame-field", action="store_true", help="add Frame Field head (DinoV3FreqUNetBDDF) + DLTB-edge FFL loss (joint multi-task)")
+    p.add_argument("--frame-weight", type=float, default=0.5, help="frame-field loss weight")
     p.add_argument("--dist-dir", default="", help="distance-map label dir (for the distance head)")
     p.add_argument("--dist-weight", type=float, default=0.5)
     p.add_argument("--init-ckpt", default="", help="warm-start backbone/classifier from a trained checkpoint")
@@ -161,13 +179,15 @@ def main():
     use_bnd = bool(a.pbound_dir) and a.boundary_weight > 0
     use_dist = bool(a.dist_dir) and a.dist_head and a.dist_weight > 0
     ds = C1mLabel7(tr, a.data_dir, a.label_dir, a.crop, True, multitemporal=a.multitemporal,
-                   pbound_dir=a.pbound_dir if use_bnd else "", dist_dir=a.dist_dir if use_dist else "")
+                   pbound_dir=a.pbound_dir if use_bnd else "", dist_dir=a.dist_dir if use_dist else "",
+                   frame=a.frame_field)
     trl = torch.utils.data.DataLoader(ds, batch_size=a.batch_size, shuffle=True,
                                       num_workers=a.workers, pin_memory=True, drop_last=True)
 
     from transformers import AutoModel
     dinov3 = AutoModel.from_pretrained(a.backbone_dir, local_files_only=True)
-    Net = DinoV3FreqUNetBDD if a.dist_head else (DinoV3FreqUNetBD if a.boundary_decoder else DinoV3FreqUNet)
+    Net = (DinoV3FreqUNetBDDF if a.frame_field else DinoV3FreqUNetBDD if a.dist_head
+           else DinoV3FreqUNetBD if a.boundary_decoder else DinoV3FreqUNet)
     model = Net(dinov3, num_classes=NCLS, in_channels=in_ch, unfreeze_last_n=a.unfreeze).to(a.device)
     if a.init_ckpt:
         isd = torch.load(a.init_ckpt, map_location=a.device, weights_only=True); msd = model.state_dict()
@@ -191,10 +211,11 @@ def main():
     best = -1.0
     for ep in range(a.epochs):
         model.train(); t0 = time.time(); el = 0.0; nb = 0
-        for x, y, bnd, dist in trl:
-            x = x.to(a.device); y = y.to(a.device); bnd = bnd.to(a.device); dist = dist.to(a.device); opt.zero_grad()
+        for x, y, bnd, dist, frame in trl:
+            x = x.to(a.device); y = y.to(a.device); bnd = bnd.to(a.device); dist = dist.to(a.device)
+            frame = frame.to(a.device); opt.zero_grad()
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                cls_lg, bnd_lg, dist_lg = model(x)
+                _o = model(x); cls_lg, bnd_lg, dist_lg = _o[0], _o[1], _o[2]   # BDDF: _o[3]=frame field
                 if cls_lg.shape[-2:] != y.shape[-2:]:
                     cls_lg = F.interpolate(cls_lg, size=y.shape[-2:], mode="bilinear", align_corners=False)
                     bnd_lg = F.interpolate(bnd_lg, size=y.shape[-2:], mode="bilinear", align_corners=False)
@@ -224,6 +245,18 @@ def main():
                     if has.any():
                         dl = F.l1_loss(torch.sigmoid(dist_lg[:, 0].float())[has], dist[has])
                         loss = loss + a.dist_weight * dl
+                if a.frame_field:                                  # FFL: f(z)=z⁴+c2 z²+c0 vanishes at û & iû (edge dir +90°)
+                    ff = _o[3]
+                    if ff.shape[-2:] != y.shape[-2:]:
+                        ff = F.interpolate(ff, size=y.shape[-2:], mode="bilinear", align_corners=False)
+                    c0 = torch.complex(ff[:, 0].float(), ff[:, 1].float())
+                    c2 = torch.complex(ff[:, 2].float(), ff[:, 3].float())
+                    u2 = torch.complex(frame[:, 0], frame[:, 1]); u4 = u2 * u2; band = frame[:, 2]
+                    fu = u4 + c2 * u2 + c0; fiu = u4 - c2 * u2 + c0
+                    fl = ((fu.abs() ** 2 + fiu.abs() ** 2) * band).sum() / (band.sum() + 1.0)
+                    sm = sum((ff[:, k, :, 1:] - ff[:, k, :, :-1]).abs().mean()
+                             + (ff[:, k, 1:, :] - ff[:, k, :-1, :]).abs().mean() for k in range(4))
+                    loss = loss + a.frame_weight * (fl + 0.05 * sm)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sch.step()
