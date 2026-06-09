@@ -25,13 +25,15 @@ NAME_ZH = {c[0]: c[1] for c in CLASSES}; NAME_EN = {c[0]: c[2] for c in CLASSES}
 RGB = {c[0]: c[3] for c in CLASSES}; HEX = {c[0]: "#%02x%02x%02x" % c[3] for c in CLASSES}
 
 
-def smooth_geom(geom, iters=2):
-    """Chaikin corner-cutting: rasterised parcel edges (pixel staircase) -> smooth curves. Topology-safe."""
+def smooth_geom(geom, iters=2, max_pts=120):
+    """Chaikin corner-cutting: rasterised parcel edges (pixel staircase) -> smooth curves. Topology-safe.
+    Rings with >max_pts vertices are left to Douglas-Peucker only (Chaikin would blow up huge regions
+    into wavy 100k-point boundaries — the cause of the 'wavy line' artefact)."""
     from shapely.geometry import Polygon, MultiPolygon
 
     def chaikin(coords):
         pts = list(coords)
-        if len(pts) < 4:
+        if len(pts) < 4 or len(pts) > max_pts:                     # tiny or huge ring -> skip (no blow-up)
             return pts
         for _ in range(iters):
             out = []
@@ -84,6 +86,22 @@ def build_idmap(clsprob, dist, bnd, a):
         sel = cc > 0
         gid = remap[cc[sel]]
         idmap[sel] = np.where(gid > 0, gid, idmap[sel])            # assign whole class in one vectorised step
+    # gap fill: assign any still-empty pixel to its NEAREST instance -> no white slivers / topology holes
+    empty = idmap == 0
+    if empty.any() and (idmap > 0).any():
+        from scipy import ndimage as ndi
+        ds = max(1, getattr(a, "downscale", 1))
+        if ds > 1:                                                 # downsample the EDT for big mosaics
+            sm = cv2.resize(idmap, (max(1, idmap.shape[1] // ds), max(1, idmap.shape[0] // ds)),
+                            interpolation=cv2.INTER_NEAREST)
+            es = sm == 0
+            if es.any() and (sm > 0).any():
+                _, (iy, ix) = ndi.distance_transform_edt(es, return_indices=True)
+                sm = sm[iy, ix]
+            idmap = cv2.resize(sm, (idmap.shape[1], idmap.shape[0]), interpolation=cv2.INTER_NEAREST)
+        else:
+            _, (iy, ix) = ndi.distance_transform_edt(empty, return_indices=True)
+            idmap = idmap[iy, ix]
     return idmap, cls_of
 
 
@@ -106,8 +124,12 @@ def export_cell(model, x6, bbox, name, a, out_dir):
         if simp > 0:
             gs = g.simplify(simp, preserve_topology=True)          # drop pixel-staircase points
             g = gs if (not gs.is_empty and gs.is_valid) else g
-        if getattr(a, "smooth_iters", 2) > 0:
-            g = smooth_geom(g, a.smooth_iters)                     # Chaikin -> smooth curved edges
+        if getattr(a, "smooth_iters", 1) > 0:
+            g = smooth_geom(g, a.smooth_iters)                     # Chaikin -> smooth curved edges (small rings only)
+        if not g.is_valid:
+            g = g.buffer(0)                                        # repair self-intersections from simplify/Chaikin
+        if g.is_empty or g.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
         area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
         rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
                      "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})
@@ -186,7 +208,7 @@ def main():
     ap.add_argument("--ridge", action="store_true")
     ap.add_argument("--simplify-px", type=float, default=2.0)
     ap.add_argument("--downscale", type=int, default=1, help=">1: watershed on /N grid (big mosaic in one pass, no cell seams)")
-    ap.add_argument("--smooth-iters", type=int, default=2, help="Chaikin corner-cutting iterations (0=off)")
+    ap.add_argument("--smooth-iters", type=int, default=1, help="Chaikin corner-cutting iterations (0=off; >1 risks waviness)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--out-dir", default="/mnt/sda/zf/landform/results/parcel_product")
     ap.add_argument("--prefix", default="", help="glob cells by prefix (e.g. 620123_ for a whole county)")

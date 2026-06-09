@@ -41,7 +41,7 @@ def infer_heads(model, x6, dev, cs=448):
             xc = np.concatenate([norm6(x6[:, t:t + cs, l:l + cs]), ndvi[:, t:t + cs, l:l + cs]], 0)
             xb = torch.from_numpy(xc).unsqueeze(0).to(dev)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                cls_lg, bnd_lg, dist_lg = model(xb)
+                _o = model(xb); cls_lg, bnd_lg, dist_lg = _o[0], _o[1], _o[2]   # BDDF returns 4 (incl frame field)
                 if cls_lg.shape[-2:] != (cs, cs):
                     cls_lg = F.interpolate(cls_lg, size=(cs, cs), mode="bilinear", align_corners=False)
                     bnd_lg = F.interpolate(bnd_lg, size=(cs, cs), mode="bilinear", align_corners=False)

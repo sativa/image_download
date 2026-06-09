@@ -31,7 +31,7 @@ class _Params:
         self.min_area_px = int(getattr(cfg, "min_marker", 0) or 200)
         self.ridge = bool(getattr(cfg, "ridge", False))
         self.downscale = 1                                         # set per-image in run() (big mosaic -> 4)
-        self.smooth_iters = int(getattr(cfg, "smooth_iters", 2))
+        self.smooth_iters = int(getattr(cfg, "smooth_iters", 1))
 
 
 def run_parcel_dist(cfg, device: str) -> None:
@@ -90,7 +90,11 @@ def run_parcel_dist(cfg, device: str) -> None:
             gs = g.simplify(simp, preserve_topology=True)
             g = gs if (not gs.is_empty and gs.is_valid) else g
         if params.smooth_iters > 0:
-            g = smooth_geom(g, params.smooth_iters)                # Chaikin -> smooth curved edges
+            g = smooth_geom(g, params.smooth_iters)                # Chaikin -> smooth curved edges (small rings only)
+        if not g.is_valid:
+            g = g.buffer(0)                                        # repair self-intersections
+        if g.is_empty or g.geom_type not in ("Polygon", "MultiPolygon"):
+            continue
         area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
         rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
                      "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})

@@ -156,6 +156,8 @@ class DinoV3FreqUNet(nn.Module):
         cls, bnd, gd = self.classifier(f), self.boundary_head(f), self.gdlx_head(f)
         if return_feat:
             return cls, bnd, gd, tok.mean(1)                       # mean-pooled backbone feat for DANN domain head
+        if hasattr(self, "frame_field_head"):                      # Frame Field Learning (4th output)
+            return cls, bnd, gd, self.frame_field_head(f)
         return cls, bnd, gd
 
 
@@ -177,6 +179,18 @@ class DinoV3FreqUNetBDD(DinoV3FreqUNetBD):
         super().__init__(*args, **kw)
         C = self.classifier.in_channels
         self.gdlx_head = nn.Sequential(ConvBNReLU(C, C), nn.Conv2d(C, 1, 1))   # 3rd output = distance
+
+
+class DinoV3FreqUNetBDDF(DinoV3FreqUNetBDD):
+    """BDD + a FRAME-FIELD head (Girard et al., CVPR'21 'Polygonal Building Extraction by Frame Field
+    Learning'): per-pixel complex coeffs (c0, c2) of the frame-field polynomial f(z)=z^4 + c2·z^2 + c0,
+    whose roots are the two orthogonal local edge directions. Supervised by DLTB polygon edge tangents,
+    it guides polygonisation to REGULAR, wave-free, topology-clean polygons (vs raster marching-squares +
+    Chaikin). forward -> (cls, bnd, dist, frame_field[B,4,H,W] = c0_re,c0_im,c2_re,c2_im)."""
+    def __init__(self, *args, **kw):
+        super().__init__(*args, **kw)
+        C = self.classifier.in_channels
+        self.frame_field_head = nn.Sequential(ConvBNReLU(C, C), nn.Conv2d(C, 4, 1), nn.Tanh())  # coeffs in [-1,1]
 
 
 class DinoV3DySampleUNet(nn.Module):
