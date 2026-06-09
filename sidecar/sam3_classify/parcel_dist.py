@@ -55,9 +55,10 @@ def run_parcel_dist(cfg, device: str) -> None:
     H, W, _ = rgb.shape
 
     _emit({"type": "stage", "stage": "loading_model", "device": device, "backend": "parcel_dist"})
+    dev = device if str(device).startswith("cuda") else "cpu"     # MPS DINOv3 unstable -> CPU on Mac (slow but works)
     d3 = AutoModel.from_pretrained(str(cfg.backbone_dir), local_files_only=True)
-    model = DinoV3FreqUNetBDD(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).to(device)
-    sd_ = torch.load(cfg.weights, map_location=device, weights_only=True)
+    model = DinoV3FreqUNetBDD(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).to(dev)
+    sd_ = torch.load(cfg.weights, map_location=dev, weights_only=True)
     msd = model.state_dict()
     model.load_state_dict({k: v for k, v in sd_.items() if k in msd and msd[k].shape == v.shape}, strict=False)
     model.eval()
@@ -66,8 +67,7 @@ def run_parcel_dist(cfg, device: str) -> None:
     x6 = np.concatenate([rgb_chw, rgb_chw], 0)                     # GeoTIFF is one source -> duplicate to 6-ch
 
     _emit({"type": "stage", "stage": "classifying_pixels", "backend": "parcel_dist"})
-    dev = device if str(device).startswith("cuda") else "cpu"
-    clsprob, dist, bnd = infer_heads(model, x6, dev)               # Hann-blended tiling (no seams)
+    clsprob, dist, bnd = infer_heads(model, x6, dev)               # Hann-blended tiling (no seams); dev set above
 
     _emit({"type": "stage", "stage": "delineating_parcels"})
     params = _Params(cfg)

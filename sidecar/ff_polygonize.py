@@ -53,7 +53,10 @@ def regularize_ring(coords, ffc0, ffc2, snap_deg=35.0):
     pts = []
     for i in range(n):
         p = _line_intersect(lines[i], lines[(i + 1) % n])
-        pts.append(p if p is not None else coords[i + 1])
+        orig = coords[i + 1]
+        if p is None or abs(p[0] - orig[0]) + abs(p[1] - orig[1]) > 40:   # near-parallel -> far intersect; keep original
+            p = orig
+        pts.append((float(p[0]), float(p[1])))
     pts.append(pts[0])
     return pts
 
@@ -154,7 +157,7 @@ def _tiled_ff(model, x6, dev, cs=448):
                 ff = model(xb)[3]
                 if ff.shape[-2:] != (cs, cs):
                     ff = F.interpolate(ff, size=(cs, cs), mode="bilinear", align_corners=False)
-                ff = ff.float()[0].cpu().numpy()
+                ff = ff.detach().float()[0].cpu().numpy()
             acc[:, t:t + cs, l:l + cs] += ff * win; cnt[t:t + cs, l:l + cs] += win
     cnt = np.maximum(cnt, 1e-6); acc /= cnt
     c0 = acc[0] + 1j * acc[1]; c2 = acc[2] + 1j * acc[3]

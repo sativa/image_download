@@ -468,3 +468,16 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
   /--smooth-iters。
 - **结果:** 榆中连续 ~12×12km 单图,12961 地块,**无 cell 接边、边界平滑、连续全覆盖**(yuzhong_cont2_preview/zoom.png)。
   parcel_dist 部署后端同步受益(大图自动 downscale+平滑)。
+
+**[2026-06-09] Frame Field Learning (栅格转矢量学习型方案) — 验证成功:** 用户问"训练好的栅格转矢量大模型"——
+答=Frame Field Learning(Girard CVPR21),用 DLTB 微调。
+- **实现:** DinoV3FreqUNetBDDF(frame field head 输出复多项式 c0/c2) + train_framefield.py(DLTB边缘切线 GT=
+  dist-transform梯度旋90°→û²; FFL align loss |f(û)|²+|f(iû)|²; warm-start dino_v3_bdd head-only 0.15M; spawn
+  workers避CUDA-fork) + ff_polygonize.py(边snap到学到的frame field方向 edge-regularization)。
+- **结果(620724_399):** 931地块, **vertices/parcel mean 80.6(后处理Chaikin)→18.9, max 78481→103**, 规则直边
+  条田、无波浪锯齿(预览 ff_poly_preview.png)。frame field仅3ep(align 1.290→1.245趋平,head-only粗)已显著规则化。
+- **关键修复:** infer_heads autocast改条件(Mac MPS/CPU兼容)/parcel_dist dev一致(model+data同device)/BDDF返回4-tuple
+  infer_heads取前3/ff detach()/_line_intersect近平行飞点clamp 40px(否则extent爆到1°×1°)。
+- **小问题待修:** ff_polygonize per-instance contour 间有白gap(regularize收缩, 可gap fill); frame field联合训
+  decoder(multi-task)会更准→更规则。**栅格转矢量学习型(FFL+DLTB)验证可行,polygon规则度远超后处理。**
+- **服务器:** .250 曾宕机~1hr(uptime重置), 恢复后续跑; 所有进展无丢失。
