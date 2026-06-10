@@ -491,3 +491,12 @@ dino_v3_bddf, warm-start dino_v3_bdd, OA 0.804 保持没退/macroF1 0.649)。aut
 - ff_polygonize 剩白缝(per-instance contour 收缩, 非耕地类少), 待 gap fill 治。
 - **FFL(栅格转矢量学习型, DLTB监督)完整验证: polygon顶点 mean 80→19, 直边规则无波浪。** 脚本 train_framefield.py
   (head-only) / train_dino_7class --frame-field(联合) / ff_polygonize.py(edge-regularization)。期间.250宕机1次恢复。
+
+**[2026-06-10] FFL 三件套收尾(全做+论文):** ① ff_polygonize 顶点位移 clamp 40→8px(局部拉直波浪但贴住共享边界)
+→ **白缝基本消失**(对比图田块连片, 1010 parcels=后处理同数=全覆盖, mean 19.8)。② parcel_dist 部署集成:
+模型类→DinoV3FreqUNetBDDF(超集,旧BDD权重兼容), 检测 ckpt 含 frame_field_head 权重时自动走 polygonize_ff
+("ff_regularized":true), 否则回退 simplify+Chaikin; 联合训权重(dino_v3_bddf, cls+bnd+dist+frame 四头一模型)已传
+Mac parcel_dist.pt — **GUI parcel_dist 后端自动输出 FFL 规则矢量(GeoParquet)**。端到端验证榆中tif: 380地块/7类/
+ff_regularized:true。③ 论文: rse_manuscript §4.12 加 FFL 小节(DLTB边缘切线监督 frame field, 顶点 mean 81→19/
+max 7.8万→~10², 规则度对 frame 精度不敏感=3ep head-only 已够, 联合训价值=四头一模型部署; 首个用国土调查矢量
+监督 frame-field 农地矢量化) + Girard CVPR21 引用, pandoc 同步 docx。

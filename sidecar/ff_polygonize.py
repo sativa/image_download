@@ -54,7 +54,9 @@ def regularize_ring(coords, ffc0, ffc2, snap_deg=35.0):
     for i in range(n):
         p = _line_intersect(lines[i], lines[(i + 1) % n])
         orig = coords[i + 1]
-        if p is None or abs(p[0] - orig[0]) + abs(p[1] - orig[1]) > 40:   # near-parallel -> far intersect; keep original
+        # cap vertex displacement at 8 px: straightens local staircase/waves but stays ON the shared
+        # boundary, so neighbouring (independently regularized) parcels keep near-zero gaps between them.
+        if p is None or abs(p[0] - orig[0]) + abs(p[1] - orig[1]) > 8:
             p = orig
         pts.append((float(p[0]), float(p[1])))
     pts.append(pts[0])

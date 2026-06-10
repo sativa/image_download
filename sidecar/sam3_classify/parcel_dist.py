@@ -45,7 +45,7 @@ def run_parcel_dist(cfg, device: str) -> None:
     sd = _sidecar_dir()
     if str(sd) not in sys.path:
         sys.path.insert(0, str(sd))
-    from train_dino_1m_v3 import DinoV3FreqUNetBDD
+    from train_dino_1m_v3 import DinoV3FreqUNetBDDF
     from transformers import AutoModel
     from dino_parcel_eval import infer_heads, dist_peak_instances  # noqa: F401 (dist_peak_instances via build_idmap)
     from dino_parcel_export import build_idmap, smooth_geom, NAME_ZH, NAME_EN, HEX, RGB, CLASSES
@@ -57,11 +57,14 @@ def run_parcel_dist(cfg, device: str) -> None:
     _emit({"type": "stage", "stage": "loading_model", "device": device, "backend": "parcel_dist"})
     dev = device if str(device).startswith("cuda") else "cpu"     # MPS DINOv3 unstable -> CPU on Mac (slow but works)
     d3 = AutoModel.from_pretrained(str(cfg.backbone_dir), local_files_only=True)
-    model = DinoV3FreqUNetBDD(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).to(dev)
+    model = DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).to(dev)   # superset of BDD
     sd_ = torch.load(cfg.weights, map_location=dev, weights_only=True)
     msd = model.state_dict()
     model.load_state_dict({k: v for k, v in sd_.items() if k in msd and msd[k].shape == v.shape}, strict=False)
     model.eval()
+    # frame-field regularized vectorization is available iff the ckpt actually contains trained FF weights
+    has_ff = any(k.startswith("frame_field_head") for k in sd_)
+    use_ff = has_ff and bool(getattr(cfg, "ff_regularize", True))
 
     rgb_chw = np.ascontiguousarray(rgb.transpose(2, 0, 1)).astype(np.uint8)
     x6 = np.concatenate([rgb_chw, rgb_chw], 0)                     # GeoTIFF is one source -> duplicate to 6-ch
@@ -74,30 +77,41 @@ def run_parcel_dist(cfg, device: str) -> None:
     params.downscale = 4 if max(H, W) > 5000 else 1                # big mosaic -> downscaled single-pass watershed (no seams)
     idmap, cls_of = build_idmap(clsprob, dist, bnd, params)        # dist-peak cropland + CC others, full coverage
 
-    _emit({"type": "stage", "stage": "polygonizing"})
+    _emit({"type": "stage", "stage": "polygonizing", "ff_regularized": bool(use_ff)})
     transform = profile["transform"]; crs = profile["crs"]
     pix_m = (float(wgs84_bbox[2]) - float(wgs84_bbox[0])) * 111320 * math.cos(
         math.radians((float(wgs84_bbox[1]) + float(wgs84_bbox[3])) / 2)) / W
     simp = float(getattr(cfg, "simplify_px", 0) or 2.0) * abs(transform.a)
     areas_px = np.bincount(idmap.ravel())
     rows = []
-    for geom, val in rasterio.features.shapes(idmap, mask=idmap > 0, connectivity=8, transform=transform):
-        pid = int(val); c = cls_of.get(pid)
-        if not c:
-            continue
-        g = shape(geom)
-        if simp > 0:
-            gs = g.simplify(simp, preserve_topology=True)
-            g = gs if (not gs.is_empty and gs.is_valid) else g
-        if params.smooth_iters > 0:
-            g = smooth_geom(g, params.smooth_iters)                # Chaikin -> smooth curved edges (small rings only)
-        if not g.is_valid:
-            g = g.buffer(0)                                        # repair self-intersections
-        if g.is_empty or g.geom_type not in ("Polygon", "MultiPolygon"):
-            continue
-        area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
-        rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
-                     "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})
+    if use_ff:
+        # FFL route: edges snapped to the learned frame field -> regular, wave-free polygons
+        from ff_polygonize import polygonize_ff, _tiled_ff
+        ffc0, ffc2 = _tiled_ff(model, x6, dev)
+        rows = polygonize_ff(idmap, cls_of, ffc0, ffc2, transform,
+                             simp_px=float(getattr(cfg, "simplify_px", 0) or 2.0))
+        for r in rows:
+            pid = r["parcel_id"]; c = r["class_id"]
+            r.update({"label": NAME_ZH[c], "label_en": NAME_EN[c], "rgb_hex": HEX[c],
+                      "area_m2": round(float(areas_px[pid]) * pix_m * pix_m, 1) if pid < len(areas_px) else 0.0})
+    else:
+        for geom, val in rasterio.features.shapes(idmap, mask=idmap > 0, connectivity=8, transform=transform):
+            pid = int(val); c = cls_of.get(pid)
+            if not c:
+                continue
+            g = shape(geom)
+            if simp > 0:
+                gs = g.simplify(simp, preserve_topology=True)
+                g = gs if (not gs.is_empty and gs.is_valid) else g
+            if params.smooth_iters > 0:
+                g = smooth_geom(g, params.smooth_iters)            # Chaikin -> smooth curved edges (small rings only)
+            if not g.is_valid:
+                g = g.buffer(0)                                    # repair self-intersections
+            if g.is_empty or g.geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+            area_m2 = float(areas_px[pid]) * pix_m * pix_m if pid < len(areas_px) else 0.0
+            rows.append({"parcel_id": pid, "class_id": c, "label": NAME_ZH[c], "label_en": NAME_EN[c],
+                         "rgb_hex": HEX[c], "area_m2": round(area_m2, 1), "geometry": g})
     gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
     out_dir = cfg.output_tif.parent; base = cfg.output_tif.stem
     parquet_path = out_dir / f"{base}.parquet"; gpkg_path = out_dir / f"{base}.gpkg"
