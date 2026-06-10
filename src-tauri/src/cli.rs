@@ -98,6 +98,9 @@ struct BatchArgs {
     compress: String,
     /// JPEG quality 1..=100 (only used when compress=jpeg).
     quality: u8,
+    /// `--classify [backend]`: after downloading, run the trained model over every cell tif
+    /// (same python sidecar the GUI uses) and emit per-parcel polygons. None = download only.
+    classify: Option<String>,
 }
 
 impl BatchArgs {
@@ -139,10 +142,17 @@ OPTIONS:
                          3-band, ~2x) | none (uncompressed RGBA 4-band)
                          [default: jpeg]
     --quality <Q>        JPEG quality 1..100 (compress=jpeg only) [default: 95]
+    --classify [B]       After downloading, classify every cell with the trained
+                         model (python sidecar) and write per-parcel polygons
+                         (GeoParquet+GPKG+GeoJSON). B = parcel_dist (default,
+                         best: dist-peak + frame-field regularized vectors) |
+                         cropland | parcel_bh | parcel | landcover.
     -h, --help           Show this help.
 
 Output: one EPSG:3857 GeoTIFF per cell, named
-    {county}_{idx}[_{source}].tif   (skips files that already exist)";
+    {county}_{idx}[_{source}].tif   (skips files that already exist)
+
+See also: imagery-downloader classify --help   (classify existing GeoTIFFs)";
 
 /// Parse argv after the leading `batch` token. Returns `Err(message)` for
 /// bad/missing flags; the caller prints it and exits non-zero.
@@ -155,6 +165,7 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
     let mut retry_per_tile: u32 = 3;
     let mut compress = "jpeg".to_string();
     let mut quality: u8 = 95;
+    let mut classify: Option<String> = None;
 
     // Grab the value following the flag at index `i`, advancing `i` past it.
     fn value_at(argv: &[String], i: &mut usize, name: &str) -> Result<String, String> {
@@ -187,6 +198,17 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
                     .map_err(|_| "--retry-per-tile must be an integer".to_string())?
             }
             "--compress" => compress = value_at(argv, &mut i, "--compress")?,
+            "--classify" => {
+                // Optional value: bare `--classify` defaults to the best backend (parcel_dist).
+                let next = argv.get(i + 1).map(String::as_str);
+                classify = Some(match next {
+                    Some(v) if !v.starts_with("--") => {
+                        i += 1;
+                        v.to_string()
+                    }
+                    _ => "parcel_dist".to_string(),
+                });
+            }
             "--quality" => {
                 quality = value_at(argv, &mut i, "--quality")?
                     .parse()
@@ -216,6 +238,12 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
     if !(1..=100).contains(&quality) {
         return Err(format!("--quality {quality} out of range 1..=100"));
     }
+    if let Some(b) = &classify {
+        match b.as_str() {
+            "parcel_dist" | "cropland" | "parcel_bh" | "parcel" | "landcover" => {}
+            other => return Err(format!("--classify backend must be parcel_dist|cropland|parcel_bh|parcel|landcover, got {other}")),
+        }
+    }
     Ok(BatchArgs {
         regions,
         out,
@@ -225,6 +253,7 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
         retry_per_tile,
         compress,
         quality,
+        classify,
     })
 }
 
@@ -364,7 +393,13 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
         "[batch] done: {wrote} wrote, {skipped} skipped, {failed} failed in {:.1}s",
         started.elapsed().as_secs_f64()
     );
-    if failed > 0 {
+
+    // Chained classification: run the trained model over every downloaded cell.
+    let mut classify_failed = 0usize;
+    if let Some(backend) = &args.classify {
+        classify_failed = classify_dir(&args.out, backend, &SidecarOpts::from_env());
+    }
+    if failed > 0 || classify_failed > 0 {
         1
     } else {
         0
@@ -453,6 +488,225 @@ async fn download_one_cell(
             CellResult::Failed
         }
     }
+}
+
+// ───────────────────────── classification (trained model → polygons) ─────────────────────────
+//
+// `imagery-downloader classify …` and `batch --classify` both spawn the *same* python sidecar the
+// GUI uses (`python -m sam3_classify`), so CLI products are identical to GUI products: per-parcel
+// polygons as GeoParquet + GPKG + GeoJSON + class raster + legend. Sequential per tif (the sidecar
+// saturates the GPU/CPU by itself); resumable (skips tifs whose .landform.parquet already exists).
+
+/// Paths the sidecar needs. Hard-coded dev defaults, each overridable by env var
+/// (same vars as the GUI: SAM3_PYTHON / SAM3_SIDECAR_DIR / CROPLAND_BACKBONE / *_WEIGHTS).
+struct SidecarOpts {
+    python: String,
+    sidecar_dir: PathBuf,
+    backbone: String,
+    device: String,
+}
+
+impl SidecarOpts {
+    fn from_env() -> Self {
+        Self {
+            python: std::env::var("SAM3_PYTHON")
+                .unwrap_or_else(|_| "/Users/zhangfeng/D/sam3/sam3_env_py312/bin/python".into()),
+            sidecar_dir: std::env::var("SAM3_SIDECAR_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from("/Users/zhangfeng/CODE_BLOCK_DNDC/imagery_downloader/sidecar")
+                }),
+            backbone: std::env::var("CROPLAND_BACKBONE")
+                .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/dinov3-vitl16-sat493m".into()),
+            device: "auto".into(),
+        }
+    }
+}
+
+/// Default checkpoint per backend (mirrors commands::classify so GUI and CLI agree).
+fn weights_for(backend: &str) -> String {
+    match backend {
+        "parcel_dist" => std::env::var("PARCEL_DIST_WEIGHTS")
+            .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/parcel_dist.pt".into()),
+        "landcover" | "parcel_bh" => std::env::var("LANDCOVER_WEIGHTS")
+            .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/landcover8_bh.pt".into()),
+        "cropland" | "parcel" => std::env::var("CROPLAND_WEIGHTS")
+            .unwrap_or_else(|_| "/Users/zhangfeng/D/cropland_dino/cropland_gdlxff.pt".into()),
+        _ => std::env::var("SAM3_WEIGHTS")
+            .unwrap_or_else(|_| "/Users/zhangfeng/D/sam3/sam3_weights/sam3.pt".into()),
+    }
+}
+
+/// Classify ONE GeoTIFF via the sidecar. Streams its stage/done/error NDJSON lines through
+/// (suppresses the very chatty per-tile progress records). Returns true on success.
+fn classify_one(input: &Path, output: &Path, backend: &str, opts: &SidecarOpts) -> bool {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let mut cmd = Command::new(&opts.python);
+    cmd.current_dir(&opts.sidecar_dir)
+        .arg("-m")
+        .arg("sam3_classify")
+        .arg("--input")
+        .arg(input)
+        .arg("--output")
+        .arg(output)
+        .arg("--weights")
+        .arg(weights_for(backend))
+        .arg("--backbone-dir")
+        .arg(&opts.backbone)
+        .arg("--backend")
+        .arg(backend)
+        .arg("--device")
+        .arg(&opts.device)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[classify]   ✗ cannot spawn sidecar ({}): {e}", opts.python);
+            return false;
+        }
+    };
+    let mut ok = false;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if line.contains("\"type\":\"done\"") {
+                ok = true;
+                println!("{line}");
+            } else if line.contains("\"type\":\"stage\"") || line.contains("\"type\":\"error\"") {
+                println!("{line}");
+            }
+        }
+    }
+    let status_ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    ok && status_ok
+}
+
+/// Classify every plain GeoTIFF in `dir` (skips previous products). Returns #failed.
+fn classify_dir(dir: &Path, backend: &str, opts: &SidecarOpts) -> usize {
+    let mut tifs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|x| x == "tif")
+                        && !p.file_name().is_some_and(|n| {
+                            let n = n.to_string_lossy();
+                            n.contains(".landform") || n.contains("_mosaic")
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    tifs.sort();
+    if tifs.is_empty() {
+        eprintln!("[classify] no input tifs in {}", dir.display());
+        return 0;
+    }
+    eprintln!("[classify] {} tifs | backend={backend} | weights={}", tifs.len(), weights_for(backend));
+    let started = Instant::now();
+    let (mut done, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    for (i, tif) in tifs.iter().enumerate() {
+        let stem = tif.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let output = dir.join(format!("{stem}.landform.tif"));
+        let parquet = dir.join(format!("{stem}.landform.parquet"));
+        if parquet.exists() {
+            skipped += 1;
+            continue; // resumable
+        }
+        eprintln!("[classify] {}/{} {stem}", i + 1, tifs.len());
+        if classify_one(tif, &output, backend, opts) {
+            done += 1;
+        } else {
+            failed += 1;
+            eprintln!("[classify]   ✗ FAILED {stem}");
+        }
+    }
+    eprintln!(
+        "[classify] done: {done} classified, {skipped} skipped, {failed} failed in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    failed
+}
+
+const CLASSIFY_USAGE: &str = "\
+imagery-downloader classify — run the trained land-cover model on GeoTIFFs
+
+USAGE:
+    imagery-downloader classify --input <tif|dir> [--backend parcel_dist] \\
+        [--out <dir>] [--device auto|cpu|mps|cuda]
+
+OPTIONS:
+    --input <PATH>   One GeoTIFF, or a directory (every *.tif inside; previous
+                     products *.landform.* are skipped; resumable).
+    --backend <B>    parcel_dist (default — dist-peak watershed + frame-field
+                     regularized polygons) | cropland | parcel_bh | parcel | landcover.
+    --out <DIR>      Output dir [default: alongside each input].
+    --device <D>     auto (default) | cpu | mps | cuda.
+    -h, --help       Show this help.
+
+Env overrides: SAM3_PYTHON, SAM3_SIDECAR_DIR, CROPLAND_BACKBONE,
+PARCEL_DIST_WEIGHTS / LANDCOVER_WEIGHTS / CROPLAND_WEIGHTS / SAM3_WEIGHTS.
+
+Output per input: <stem>.landform.{parquet,gpkg,geojson,tif,legend.json}
+(GeoParquet is the primary vector product).";
+
+/// True when argv looks like `<prog> classify ...`.
+pub fn is_classify_invocation() -> bool {
+    std::env::args().nth(1).as_deref() == Some("classify")
+}
+
+/// Headless classify entry (`imagery-downloader classify …`). Exits the process.
+pub fn run_classify() -> ! {
+    let argv: Vec<String> = std::env::args().skip(2).collect();
+    let mut input: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut backend = "parcel_dist".to_string();
+    let mut opts = SidecarOpts::from_env();
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "-h" | "--help" => {
+                eprintln!("{CLASSIFY_USAGE}");
+                std::process::exit(0);
+            }
+            "--input" => {
+                i += 1;
+                input = argv.get(i).map(PathBuf::from);
+            }
+            "--out" | "--out-dir" => {
+                i += 1;
+                out = argv.get(i).map(PathBuf::from);
+            }
+            "--backend" => {
+                i += 1;
+                backend = argv.get(i).cloned().unwrap_or_default();
+            }
+            "--device" => {
+                i += 1;
+                opts.device = argv.get(i).cloned().unwrap_or_else(|| "auto".into());
+            }
+            other => {
+                eprintln!("unknown argument: {other}\n\n{CLASSIFY_USAGE}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(input) = input else {
+        eprintln!("--input is required\n\n{CLASSIFY_USAGE}");
+        std::process::exit(2);
+    };
+    let failed = if input.is_dir() {
+        classify_dir(&input, &backend, &opts)
+    } else {
+        let dir = out.unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")).to_path_buf());
+        let _ = std::fs::create_dir_all(&dir);
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let output = dir.join(format!("{stem}.landform.tif"));
+        usize::from(!classify_one(&input, &output, &backend, &opts))
+    };
+    std::process::exit(if failed > 0 { 1 } else { 0 });
 }
 
 #[cfg(test)]

@@ -8,5 +8,10 @@ fn main() {
     if imagery_downloader_lib::cli::is_batch_invocation() {
         imagery_downloader_lib::cli::run_batch();
     }
+    // Headless classify mode: `imagery-downloader classify --input <tif|dir>` —
+    // runs the trained model (python sidecar) over existing GeoTIFFs.
+    if imagery_downloader_lib::cli::is_classify_invocation() {
+        imagery_downloader_lib::cli::run_classify();
+    }
     imagery_downloader_lib::run()
 }
