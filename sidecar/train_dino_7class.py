@@ -165,6 +165,7 @@ def main():
     p.add_argument("--head-lr", type=float, default=3e-4)
     p.add_argument("--unfreeze", type=int, default=4)
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--max-cells", type=int, default=0, help="cap train cells (frame-field fine-tune needs few)")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda:0")
     a = p.parse_args()
@@ -174,6 +175,8 @@ def main():
 
     man = json.loads((Path(a.data_dir) / "manifest.json").read_text())
     tr = [n for n in man["train"] if (Path(a.label_dir) / f"{n}.npy").exists()]
+    if a.max_cells:
+        tr = tr[:a.max_cells]
     te = [n for n in man["test"] if (Path(a.label_dir) / f"{n}.npy").exists()]
     print(f"[7class] in_ch={in_ch} NCLS={NCLS} train={len(tr)} test={len(te)}", flush=True)
     use_bnd = bool(a.pbound_dir) and a.boundary_weight > 0
