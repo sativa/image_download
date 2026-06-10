@@ -499,4 +499,4 @@ dino_v3_bddf, warm-start dino_v3_bdd, OA 0.804 保持没退/macroF1 0.649)。aut
 Mac parcel_dist.pt — **GUI parcel_dist 后端自动输出 FFL 规则矢量(GeoParquet)**。端到端验证榆中tif: 380地块/7类/
 ff_regularized:true。③ 论文: rse_manuscript §4.12 加 FFL 小节(DLTB边缘切线监督 frame field, 顶点 mean 81→19/
 max 7.8万→~10², 规则度对 frame 精度不敏感=3ep head-only 已够, 联合训价值=四头一模型部署; 首个用国土调查矢量
-监督 frame-field 农地矢量化) + Girard CVPR21 引用, pandoc 同步 docx。
+监督 frame-field 全类地物(7类)矢量化, 耕地为其中最准类) + Girard CVPR21 引用, pandoc 同步 docx。
