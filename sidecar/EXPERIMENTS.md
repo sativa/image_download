@@ -481,3 +481,13 @@ Mac sidecar/parcel_product_demo/。可 QGIS/ArcGIS 直接打开。
 - **小问题待修:** ff_polygonize per-instance contour 间有白gap(regularize收缩, 可gap fill); frame field联合训
   decoder(multi-task)会更准→更规则。**栅格转矢量学习型(FFL+DLTB)验证可行,polygon规则度远超后处理。**
 - **服务器:** .250 曾宕机~1hr(uptime重置), 恢复后续跑; 所有进展无丢失。
+
+**[2026-06-10] FFL 联合训完成 + 结论:** train_dino_7class --frame-field 多任务联合训(cls+bnd+dist+frame, 6ep,
+dino_v3_bddf, warm-start dino_v3_bdd, OA 0.804 保持没退/macroF1 0.649)。auto 重测 ff_polygonize:
+**联合训(6ep) mean 19.0 max 257 ≈ head-only(3ep) mean 18.9 max 103** — 都远优于后处理 mean 80 max 7.8万。
+- **关键结论: FFL polygonization 的规则度对 frame field 精度不敏感**(edge-snap 只需方向粗对, 3ep 粗 frame field
+  已够), 联合训 polygon 不比 head-only 更规则。联合训的价值 = **一个模型同时出 cls+bnd+dist+frame**(部署友好)。
+- loader 瓶颈: frame GT dist-transform(getitem) + 多时相 NDVI 磁盘IO, ~37min/ep(GPU~3.5%饿); 减规模/预生成 GT 可加速。
+- ff_polygonize 剩白缝(per-instance contour 收缩, 非耕地类少), 待 gap fill 治。
+- **FFL(栅格转矢量学习型, DLTB监督)完整验证: polygon顶点 mean 80→19, 直边规则无波浪。** 脚本 train_framefield.py
+  (head-only) / train_dino_7class --frame-field(联合) / ff_polygonize.py(edge-regularization)。期间.250宕机1次恢复。
