@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 SIDECAR="/home/ps/landform/sidecar"; _M={}
 
-def _init(gpus, weights, backbone, counter, bboxes, halo_m):
+def _init(gpus, weights, backbone, counter, bboxes, halo_m, enhance=False):
     with counter.get_lock():
         wid=counter.value; counter.value+=1
     os.environ["CUDA_VISIBLE_DEVICES"]=str(gpus[wid%len(gpus)])
@@ -20,12 +20,13 @@ def _init(gpus, weights, backbone, counter, bboxes, halo_m):
     m=DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).cuda()
     sd=torch.load(weights, map_location="cuda", weights_only=True); msd=m.state_dict()
     m.load_state_dict({k:v for k,v in sd.items() if k in msd and msd[k].shape==v.shape}, strict=False)
-    m.eval(); _M["model"]=m; _M["bboxes"]=bboxes; _M["halo_m"]=halo_m
+    m.eval(); _M["model"]=m; _M["bboxes"]=bboxes; _M["halo_m"]=halo_m; _M["enhance"]=enhance
     print("[worker %d] resident on GPU %s"%(wid,os.environ["CUDA_VISIBLE_DEVICES"]), flush=True)
 
-def _infer_all(model, x6, cs=448):
+def _infer_all(model, x6, cs=448, enh=False):
     import torch, torch.nn.functional as F
     from train_dino_1m import norm6
+    if enh: from train_dino_1m_v3 import enhance6
     _,H,W=x6.shape; ndvi=np.zeros((5,H,W),np.float32)
     acc=np.zeros((9,H,W),np.float32); accd=np.zeros((H,W),np.float32); accb=np.zeros((H,W),np.float32)
     accf=np.zeros((4,H,W),np.float32); cnt=np.zeros((H,W),np.float32); st=max(1,cs//2)
@@ -35,7 +36,8 @@ def _infer_all(model, x6, cs=448):
     win=np.maximum(np.outer(np.hanning(cs),np.hanning(cs)),1e-3).astype(np.float32)
     for t in ys:
         for l in xs:
-            xc=np.concatenate([norm6(x6[:,t:t+cs,l:l+cs]), ndvi[:,t:t+cs,l:l+cs]],0)
+            _tile=x6[:,t:t+cs,l:l+cs]
+            xc=np.concatenate([norm6(enhance6(_tile) if enh else _tile), ndvi[:,t:t+cs,l:l+cs]],0)  # per-tile 梯田锐化(同训练口径)
             xb=torch.from_numpy(xc).unsqueeze(0).cuda()
             with torch.amp.autocast("cuda",dtype=torch.bfloat16), torch.no_grad():
                 o=model(xb); cl,bn,ds,ff=o[0],o[1],o[2],o[3]
@@ -75,20 +77,22 @@ def _process(task):
         srcs=[rasterio.open(f) for f in files]; crs=srcs[0].crs
         mosaic,tr=merge(srcs, bounds=exp); [s.close() for s in srcs]
         rgb=np.ascontiguousarray(mosaic[:3]).astype(np.uint8); x6=np.concatenate([rgb,rgb],0)
-        cls,dist,bnd,c0,c2=_infer_all(_M["model"], x6)            # core+halo: Hanning-blended overlapping windows -> consistent borders
-        idmap,cls_of=build_idmap(cls,dist,bnd,_P())
+        cls,dist,bnd,c0,c2=_infer_all(_M["model"], x6, enh=_M.get("enhance",False))   # core+halo Hann-blended + per-tile 梯田锐化
+        P=_P(); P.downscale = 4 if max(cls.shape[1],cls.shape[2])>5000 else 1          # big block -> downscaled unified dist-peak watershed
+        idmap,cls_of=build_idmap(cls,dist,bnd,P)
         from rasterio.windows import from_bounds as _fb, transform as _wtr, Window as _Win
-        win=_fb(core[0],core[1],core[2],core[3], tr)              # crop idmap back to CORE -> exact tiling, zero output overlap
+        win=_fb(core[0],core[1],core[2],core[3], tr)              # crop back to CORE -> exact tiling, zero output overlap
         r0=max(0,int(round(win.row_off))); c0p=max(0,int(round(win.col_off)))
-        hh=int(round(win.height)); ww=int(round(win.width))
-        idmap=np.ascontiguousarray(idmap[r0:r0+hh, c0p:c0p+ww]); tr=_wtr(_Win(c0p,r0,ww,hh), tr)
+        hh=int(round(win.height)); ww=int(round(win.width)); sl=(slice(r0,r0+hh),slice(c0p,c0p+ww))
+        idmap=np.ascontiguousarray(idmap[sl].astype(np.int32))
+        tr=_wtr(_Win(c0p,r0,ww,hh), tr)
         from rasterio.features import shapes as _shapes
         from shapely.geometry import shape as _shape
-        idmap=idmap.astype(np.int32); rows=[]
-        for geom,val in _shapes(idmap, mask=idmap>0, transform=tr):   # exact partition: full cover, no overlap/overflow
+        rows=[]                                                    # 纯 shapes 精确划分(零重叠/越界, 相邻精确贴合 -> 分幅 dissolve 可干净合并; 平滑放后处理)
+        for geom,val in _shapes(idmap, mask=idmap>0, transform=tr):
             c=cls_of.get(int(val))
             if not c: continue
-            g=_shape(geom).simplify(1.5, preserve_topology=True)
+            g=_shape(geom)
             if not g.is_valid: g=g.buffer(0)
             if g.is_empty: continue
             if g.geom_type=="Polygon": rows.append({"parcel_id":int(val),"class_id":c,"geometry":g})
@@ -144,6 +148,7 @@ def main():
     ap.add_argument("--backbone", default="/home/ps/landform/dinov3/dinov3-vitl16-sat493m")
     ap.add_argument("--gpus", default="0,1,2,3"); ap.add_argument("--per-gpu", type=int, default=1)
     ap.add_argument("--block", type=int, default=2); ap.add_argument("--smoke-cell", default=""); ap.add_argument("--halo-cells", type=float, default=1.0)
+    ap.add_argument("--enhance", action="store_true", help="per-tile enhance6 梯田等高线锐化(需配 enhance 训练的权重)")
     a=ap.parse_args()
     gpus=[int(g) for g in a.gpus.split(",")]
     out_dir=Path(a.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +167,7 @@ def main():
     nproc=len(gpus)*a.per_gpu
     print("[blk] %d cells -> %d blocks (block=%dx%d), %d workers"%(len(bboxes),len(tasks),a.block,a.block,nproc), flush=True)
     counter=ctx.Value("i",0); ok=done=bad=0
-    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter,bboxes,_halo))
+    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter,bboxes,_halo,a.enhance))
     try:
         for bid,n,msg in pool.imap_unordered(_process, tasks):
             done+=1
