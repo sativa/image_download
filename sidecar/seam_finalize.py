@@ -87,12 +87,16 @@ def main():
     out = out[~out.geometry.is_empty & out.geometry.notna()].reset_index(drop=True)
     print(f"[finalize] 平滑完成 ({time.time()-t0:.0f}s)", flush=True)
 
-    # 裁真实县界
+    # 裁县界(快法, 无慢 union):质心落在任一 DLTB 图斑内则在县内 → 保留; 界外丢
+    # (95868 图斑的精确 union 太慢/会挂; point-in-poly 对 DLTB 图斑 sindex 剪枝, 秒级)
     dl = gpd.read_parquet(DLTB).to_crs(UTM)
-    boundary = unary_union(list(dl.geometry.buffer(0)))
-    out = gpd.clip(out, boundary)
+    out = out.reset_index(drop=True)
+    rp = gpd.GeoDataFrame({"i": out.index}, geometry=out.geometry.representative_point(), crs=UTM)
+    in_idx = gpd.sjoin(rp, dl[["geometry"]], predicate="within", how="inner")["i"].unique()
+    out = out.loc[in_idx].reset_index(drop=True)
     out = out[~out.geometry.is_empty & out.geometry.notna()].explode(index_parts=False)
     out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
+    print(f"[finalize] 裁县界(质心法): 保留 {len(out)} ({time.time()-t0:.0f}s)", flush=True)
     out["label_en"] = out["label"].map(EN); out["rgb_hex"] = out["label"].map(HEX)
     out["area_m2"] = out.geometry.area.round(1); out.insert(0, "gid", range(1, len(out) + 1))
     out.to_crs("EPSG:4326").to_parquet(OUT)
