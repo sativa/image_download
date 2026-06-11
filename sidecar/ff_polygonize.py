@@ -90,11 +90,16 @@ def polygonize_ff(idmap, cls_of, ffc0, ffc2, transform, simp_px=2.0, snap_deg=35
             g = Polygon(world)
             if not g.is_valid:
                 g = g.buffer(0)
-            if g.is_empty or g.geom_type != "Polygon":
+            if g.is_empty:
                 continue
         except Exception:
             continue
-        rows.append({"parcel_id": int(pid), "class_id": c, "geometry": g})
+        if g.geom_type == "Polygon":
+            rows.append({"parcel_id": int(pid), "class_id": c, "geometry": g})
+        else:                                                     # MultiPolygon/GeomCollection: keep ALL parts (dropping silently lost up to ~47%/cell)
+            for part in getattr(g, "geoms", []):
+                if getattr(part, "geom_type", "") == "Polygon" and not part.is_empty and part.area > 0:
+                    rows.append({"parcel_id": int(pid), "class_id": c, "geometry": part})
     return rows
 
 
