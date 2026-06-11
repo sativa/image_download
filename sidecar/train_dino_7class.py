@@ -20,7 +20,7 @@ import torch.nn.functional as F
 HOME = Path("/home/ps/landform"); sys.path.insert(0, str(HOME / "sidecar"))
 from train_dino_1m import norm6
 from train_dino_1m_v2 import load_ndvi_full, small_feature_w
-from train_dino_1m_v3 import DinoV3FreqUNet, DinoV3FreqUNetBD, DinoV3FreqUNetBDD, DinoV3FreqUNetBDDF, DINOV3_SAT
+from train_dino_1m_v3 import DinoV3FreqUNet, DinoV3FreqUNetBD, DinoV3FreqUNetBDD, DinoV3FreqUNetBDDF, DINOV3_SAT, enhance6
 from scipy import ndimage as _ndi
 import cv2 as _cv2
 
@@ -28,12 +28,13 @@ NAMES = ["nodata", "耕地", "园地", "林地", "草地", "水体", "建筑", "
 
 
 class C1mLabel7(torch.utils.data.Dataset):
-    def __init__(self, names, dd, label_dir, crop, training, multitemporal=False, pbound_dir="", dist_dir="", frame=False):
+    def __init__(self, names, dd, label_dir, crop, training, multitemporal=False, pbound_dir="", dist_dir="", frame=False, enhance=False):
         self.n = names; self.d = Path(dd); self.ld = Path(label_dir)
         self.c = crop; self.tr = training; self.mt = multitemporal
         self.pb = Path(pbound_dir) if pbound_dir else None
         self.dd = Path(dist_dir) if dist_dir else None
         self.frame = frame                                         # also yield frame-field GT (û² + edge band)
+        self.enhance = enhance                                     # CLAHE+unsharp 梯田等高线边缘锐化(train/eval 一致)
 
     def __len__(self):
         return len(self.n)
@@ -63,7 +64,8 @@ class C1mLabel7(torch.utils.data.Dataset):
             t = random.randint(0, SZ - cs); l = random.randint(0, SZw - cs)
         else:
             t = (SZ - cs) // 2; l = (SZw - cs) // 2
-        x = norm6(x6[:, t:t + cs, l:l + cs])
+        xc6 = x6[:, t:t + cs, l:l + cs]
+        x = norm6(enhance6(xc6) if self.enhance else xc6)          # 梯田边缘锐化 before norm
         if self.mt:
             x = np.concatenate([x, self._ndvi(nm, t, l, cs, SZ, SZw)], 0)
         lc = lbl[t:t + cs, l:l + cs]; bc = bnd[t:t + cs, l:l + cs]; dc = dist[t:t + cs, l:l + cs]
@@ -93,7 +95,7 @@ class C1mLabel7(torch.utils.data.Dataset):
 
 
 @torch.no_grad()
-def evaluate(model, names, dd, ld, dev, NCLS, cs=448, multitemporal=False):
+def evaluate(model, names, dd, ld, dev, NCLS, cs=448, multitemporal=False, enhance=False):
     """Overall accuracy + macro-F1 over valid (label>0) pixels."""
     model.eval()
     conf = np.zeros((NCLS, NCLS), np.int64)  # [true, pred] over classes 1..NCLS-1
@@ -109,7 +111,8 @@ def evaluate(model, names, dd, ld, dev, NCLS, cs=448, multitemporal=False):
         if xs[-1] != SZw - cs: xs.append(max(0, SZw - cs))
         for t in ys:
             for l in xs:
-                xc = norm6(x6[:, t:t + cs, l:l + cs])
+                _xc6 = x6[:, t:t + cs, l:l + cs]
+                xc = norm6(enhance6(_xc6) if enhance else _xc6)
                 if multitemporal:
                     nd = ndvi[:, t:t + cs, l:l + cs] if ndvi is not None else np.zeros((5, cs, cs), np.float32)
                     xc = np.concatenate([xc, nd], 0)
@@ -158,6 +161,7 @@ def main():
     p.add_argument("--dist-dir", default="", help="distance-map label dir (for the distance head)")
     p.add_argument("--dist-weight", type=float, default=0.5)
     p.add_argument("--init-ckpt", default="", help="warm-start backbone/classifier from a trained checkpoint")
+    p.add_argument("--enhance", action="store_true", help="CLAHE+unsharp 梯田等高线边缘锐化(同 ff_enh, train/eval 一致) → 强化梯田边界/分割")
     p.add_argument("--crop", type=int, default=448)
     p.add_argument("--epochs", type=int, default=24)
     p.add_argument("--batch-size", type=int, default=3)
@@ -183,7 +187,7 @@ def main():
     use_dist = bool(a.dist_dir) and a.dist_head and a.dist_weight > 0
     ds = C1mLabel7(tr, a.data_dir, a.label_dir, a.crop, True, multitemporal=a.multitemporal,
                    pbound_dir=a.pbound_dir if use_bnd else "", dist_dir=a.dist_dir if use_dist else "",
-                   frame=a.frame_field)
+                   frame=a.frame_field, enhance=a.enhance)
     trl = torch.utils.data.DataLoader(ds, batch_size=a.batch_size, shuffle=True,
                                       num_workers=a.workers, pin_memory=True, drop_last=True)
 
@@ -264,7 +268,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sch.step()
             el += loss.item(); nb += 1
-        oa, macro, per = evaluate(model, te, a.data_dir, a.label_dir, a.device, NCLS, a.crop, a.multitemporal)
+        oa, macro, per = evaluate(model, te, a.data_dir, a.label_dir, a.device, NCLS, a.crop, a.multitemporal, a.enhance)
         score = 0.5 * oa + 0.5 * macro
         if score > best:
             best = score; torch.save(model.state_dict(), out / "best.pt")

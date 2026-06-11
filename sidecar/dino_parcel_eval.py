@@ -24,8 +24,12 @@ from train_dino_1m_v3 import DinoV3FreqUNetBDD, DINOV3_SAT
 
 
 @torch.no_grad()
-def infer_heads(model, x6, dev, cs=448):
-    """tiled -> (cls 9-class softmax (9,H,W), distance sigmoid (H,W)). zero NDVI."""
+def infer_heads(model, x6, dev, cs=448, enhance=False):
+    """tiled -> (cls 9-class softmax (9,H,W), distance sigmoid (H,W)). zero NDVI.
+    enhance=True applies the same CLAHE+unsharp 梯田边缘锐化 as the enhanced model's training (consistency)."""
+    if enhance:
+        from train_dino_1m_v3 import enhance6
+        x6 = enhance6(x6)                                          # sharpen terrace contour edges before tiling/norm
     _, H, W = x6.shape
     ndvi = np.zeros((5, H, W), np.float32)
     acc = np.zeros((9, H, W), np.float32); accd = np.zeros((H, W), np.float32)
