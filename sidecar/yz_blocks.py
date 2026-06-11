@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 SIDECAR="/home/ps/landform/sidecar"; _M={}
 
-def _init(gpus, weights, backbone, counter):
+def _init(gpus, weights, backbone, counter, bboxes, halo_m):
     with counter.get_lock():
         wid=counter.value; counter.value+=1
     os.environ["CUDA_VISIBLE_DEVICES"]=str(gpus[wid%len(gpus)])
@@ -20,7 +20,7 @@ def _init(gpus, weights, backbone, counter):
     m=DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).cuda()
     sd=torch.load(weights, map_location="cuda", weights_only=True); msd=m.state_dict()
     m.load_state_dict({k:v for k,v in sd.items() if k in msd and msd[k].shape==v.shape}, strict=False)
-    m.eval(); _M["model"]=m
+    m.eval(); _M["model"]=m; _M["bboxes"]=bboxes; _M["halo_m"]=halo_m
     print("[worker %d] resident on GPU %s"%(wid,os.environ["CUDA_VISIBLE_DEVICES"]), flush=True)
 
 def _infer_all(model, x6, cs=448):
@@ -64,13 +64,24 @@ def _process(task):
     if op.exists(): return (block_id,-1,"skip")
     t0=time.time()
     try:
-        files=[str(Path(tif_dir)/("%s_esri.tif"%c)) for c in cell_list if (Path(tif_dir)/("%s_esri.tif"%c)).exists()]
+        bboxes=_M["bboxes"]; halo=_M["halo_m"]
+        cb=[bboxes[c] for c in cell_list if c in bboxes]
+        if not cb: return (block_id,-3,"no_tif")
+        core=(min(b[0] for b in cb),min(b[1] for b in cb),max(b[2] for b in cb),max(b[3] for b in cb))
+        exp=(core[0]-halo,core[1]-halo,core[2]+halo,core[3]+halo)  # >=30% overlap halo: each block sees neighbour context at its borders
+        nb=[c for c,b in bboxes.items() if not (b[2]<=exp[0] or b[0]>=exp[2] or b[3]<=exp[1] or b[1]>=exp[3])]
+        files=[str(Path(tif_dir)/("%s_esri.tif"%c)) for c in nb if (Path(tif_dir)/("%s_esri.tif"%c)).exists()]
         if not files: return (block_id,-3,"no_tif")
         srcs=[rasterio.open(f) for f in files]; crs=srcs[0].crs
-        mosaic,tr=merge(srcs); [s.close() for s in srcs]
+        mosaic,tr=merge(srcs, bounds=exp); [s.close() for s in srcs]
         rgb=np.ascontiguousarray(mosaic[:3]).astype(np.uint8); x6=np.concatenate([rgb,rgb],0)
-        cls,dist,bnd,c0,c2=_infer_all(_M["model"], x6)            # whole block
+        cls,dist,bnd,c0,c2=_infer_all(_M["model"], x6)            # core+halo: Hanning-blended overlapping windows -> consistent borders
         idmap,cls_of=build_idmap(cls,dist,bnd,_P())
+        from rasterio.windows import from_bounds as _fb, transform as _wtr, Window as _Win
+        win=_fb(core[0],core[1],core[2],core[3], tr)              # crop idmap back to CORE -> exact tiling, zero output overlap
+        r0=max(0,int(round(win.row_off))); c0p=max(0,int(round(win.col_off)))
+        hh=int(round(win.height)); ww=int(round(win.width))
+        idmap=np.ascontiguousarray(idmap[r0:r0+hh, c0p:c0p+ww]); tr=_wtr(_Win(c0p,r0,ww,hh), tr)
         from rasterio.features import shapes as _shapes
         from shapely.geometry import shape as _shape
         idmap=idmap.astype(np.int32); rows=[]
@@ -132,7 +143,7 @@ def main():
     ap.add_argument("--weights", default="/mnt/sda/zf/landform/results/dino_v3_bddf/last.pt")
     ap.add_argument("--backbone", default="/home/ps/landform/dinov3/dinov3-vitl16-sat493m")
     ap.add_argument("--gpus", default="0,1,2,3"); ap.add_argument("--per-gpu", type=int, default=1)
-    ap.add_argument("--block", type=int, default=2); ap.add_argument("--smoke-cell", default="")
+    ap.add_argument("--block", type=int, default=2); ap.add_argument("--smoke-cell", default=""); ap.add_argument("--halo-cells", type=float, default=1.0)
     a=ap.parse_args()
     gpus=[int(g) for g in a.gpus.split(",")]
     out_dir=Path(a.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +153,7 @@ def main():
         bbl=pp.map(_bbox, [(n,a.tif_dir) for n in names])
     bboxes={c:bb for c,bb in bbl if bb is not None}
     blocks=build_blocks(bboxes, a.block)
+    _cw=float(np.median([b[2]-b[0] for b in bboxes.values()])); _halo=a.halo_cells*_cw
     if a.smoke_cell:
         cb=bboxes[a.smoke_cell]
         sel=[(k,v) for k,v in blocks.items() if a.smoke_cell in v]
@@ -150,7 +162,7 @@ def main():
     nproc=len(gpus)*a.per_gpu
     print("[blk] %d cells -> %d blocks (block=%dx%d), %d workers"%(len(bboxes),len(tasks),a.block,a.block,nproc), flush=True)
     counter=ctx.Value("i",0); ok=done=bad=0
-    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter))
+    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter,bboxes,_halo))
     try:
         for bid,n,msg in pool.imap_unordered(_process, tasks):
             done+=1
