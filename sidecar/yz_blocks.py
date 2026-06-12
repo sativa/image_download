@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 SIDECAR="/home/ps/landform/sidecar"; _M={}
 
-def _init(gpus, weights, backbone, counter, bboxes, halo_m, enhance=False):
+def _init(gpus, weights, backbone, counter, bboxes, halo_m, enhance=False, ridge=False, centroid=False):
     with counter.get_lock():
         wid=counter.value; counter.value+=1
     os.environ["CUDA_VISIBLE_DEVICES"]=str(gpus[wid%len(gpus)])
@@ -20,7 +20,7 @@ def _init(gpus, weights, backbone, counter, bboxes, halo_m, enhance=False):
     m=DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).cuda()
     sd=torch.load(weights, map_location="cuda", weights_only=True); msd=m.state_dict()
     m.load_state_dict({k:v for k,v in sd.items() if k in msd and msd[k].shape==v.shape}, strict=False)
-    m.eval(); _M["model"]=m; _M["bboxes"]=bboxes; _M["halo_m"]=halo_m; _M["enhance"]=enhance
+    m.eval(); _M["model"]=m; _M["bboxes"]=bboxes; _M["halo_m"]=halo_m; _M["enhance"]=enhance; _M["ridge"]=ridge; _M["centroid"]=centroid
     print("[worker %d] resident on GPU %s"%(wid,os.environ["CUDA_VISIBLE_DEVICES"]), flush=True)
 
 def _infer_all(model, x6, cs=448, enh=False):
@@ -78,27 +78,42 @@ def _process(task):
         mosaic,tr=merge(srcs, bounds=exp); [s.close() for s in srcs]
         rgb=np.ascontiguousarray(mosaic[:3]).astype(np.uint8); x6=np.concatenate([rgb,rgb],0)
         cls,dist,bnd,c0,c2=_infer_all(_M["model"], x6, enh=_M.get("enhance",False))   # core+halo Hann-blended + per-tile 梯田锐化
-        P=_P(); P.downscale = 4 if max(cls.shape[1],cls.shape[2])>5000 else 1          # big block -> downscaled unified dist-peak watershed
+        P=_P(); P.downscale = 4 if max(cls.shape[1],cls.shape[2])>5000 else 1          # big block -> downscaled unified watershed
+        P.ridge = _M.get("ridge", False)                          # ridge(边界头)watershed -> 田块级; 否则 dist-peak
         idmap,cls_of=build_idmap(cls,dist,bnd,P)
-        from rasterio.windows import from_bounds as _fb, transform as _wtr, Window as _Win
-        win=_fb(core[0],core[1],core[2],core[3], tr)              # crop back to CORE -> exact tiling, zero output overlap
-        r0=max(0,int(round(win.row_off))); c0p=max(0,int(round(win.col_off)))
-        hh=int(round(win.height)); ww=int(round(win.width)); sl=(slice(r0,r0+hh),slice(c0p,c0p+ww))
-        idmap=np.ascontiguousarray(idmap[sl].astype(np.int32))
-        tr=_wtr(_Win(c0p,r0,ww,hh), tr)
         from rasterio.features import shapes as _shapes
         from shapely.geometry import shape as _shape
-        rows=[]                                                    # 纯 shapes 精确划分(零重叠/越界, 相邻精确贴合 -> 分幅 dissolve 可干净合并; 平滑放后处理)
-        for geom,val in _shapes(idmap, mask=idmap>0, transform=tr):
-            c=cls_of.get(int(val))
-            if not c: continue
-            g=_shape(geom)
-            if not g.is_valid: g=g.buffer(0)
-            if g.is_empty: continue
-            if g.geom_type=="Polygon": rows.append({"parcel_id":int(val),"class_id":c,"geometry":g})
-            else:
-                for pp in getattr(g,"geoms",[]):
-                    if getattr(pp,"geom_type","")=="Polygon" and not pp.is_empty and pp.area>0: rows.append({"parcel_id":int(val),"class_id":c,"geometry":pp})
+        from shapely.geometry import box as _box
+        rows=[]
+        if _M.get("centroid"):                                    # 方案B: 整块idmap矢量化, 只留质心在core的完整polygon -> 真无缝(地块永不被切, 无需缝合)
+            for geom,val in _shapes(idmap.astype(np.int32), mask=idmap>0, transform=tr):
+                c=cls_of.get(int(val))
+                if not c: continue
+                g=_shape(geom)
+                if not g.is_valid: g=g.buffer(0)
+                if g.is_empty: continue
+                rp=g.representative_point()
+                if not (core[0]<=rp.x<core[2] and core[1]<=rp.y<core[3]): continue   # 质心归属: 跨界地块由含其质心的piece完整出, 邻piece整块丢
+                if g.geom_type=="Polygon": rows.append({"parcel_id":int(val),"class_id":c,"geometry":g})
+                else:
+                    for pp in getattr(g,"geoms",[]):
+                        if getattr(pp,"geom_type","")=="Polygon" and not pp.is_empty and pp.area>0: rows.append({"parcel_id":int(val),"class_id":c,"geometry":pp})
+        else:                                                     # crop-to-core(旧, 需分幅缝合)
+            from rasterio.windows import from_bounds as _fb, transform as _wtr, Window as _Win
+            win=_fb(core[0],core[1],core[2],core[3], tr)
+            r0=max(0,int(round(win.row_off))); c0p=max(0,int(round(win.col_off)))
+            hh=int(round(win.height)); ww=int(round(win.width)); sl=(slice(r0,r0+hh),slice(c0p,c0p+ww))
+            idmap=np.ascontiguousarray(idmap[sl].astype(np.int32)); tr=_wtr(_Win(c0p,r0,ww,hh), tr)
+            for geom,val in _shapes(idmap, mask=idmap>0, transform=tr):
+                c=cls_of.get(int(val))
+                if not c: continue
+                g=_shape(geom)
+                if not g.is_valid: g=g.buffer(0)
+                if g.is_empty: continue
+                if g.geom_type=="Polygon": rows.append({"parcel_id":int(val),"class_id":c,"geometry":g})
+                else:
+                    for pp in getattr(g,"geoms",[]):
+                        if getattr(pp,"geom_type","")=="Polygon" and not pp.is_empty and pp.area>0: rows.append({"parcel_id":int(val),"class_id":c,"geometry":pp})
         if not rows:
             gpd.GeoDataFrame({"geometry":[]},crs="EPSG:4326").to_parquet(op); return (block_id,0,"%.0fs"%(time.time()-t0))
         gdf=gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
@@ -149,6 +164,8 @@ def main():
     ap.add_argument("--gpus", default="0,1,2,3"); ap.add_argument("--per-gpu", type=int, default=1)
     ap.add_argument("--block", type=int, default=2); ap.add_argument("--smoke-cell", default=""); ap.add_argument("--halo-cells", type=float, default=1.0)
     ap.add_argument("--enhance", action="store_true", help="per-tile enhance6 梯田等高线锐化(需配 enhance 训练的权重)")
+    ap.add_argument("--ridge", action="store_true", help="ridge(边界头)watershed -> 田块级 delineation(否则 dist-peak 圆块)")
+    ap.add_argument("--centroid", action="store_true", help="方案B质心归属(整块矢量化只留质心在core, 真无缝, 不裁core不缝合)")
     a=ap.parse_args()
     gpus=[int(g) for g in a.gpus.split(",")]
     out_dir=Path(a.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
@@ -167,7 +184,7 @@ def main():
     nproc=len(gpus)*a.per_gpu
     print("[blk] %d cells -> %d blocks (block=%dx%d), %d workers"%(len(bboxes),len(tasks),a.block,a.block,nproc), flush=True)
     counter=ctx.Value("i",0); ok=done=bad=0
-    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter,bboxes,_halo,a.enhance))
+    pool=ctx.Pool(nproc, initializer=_init, initargs=(gpus,a.weights,a.backbone,counter,bboxes,_halo,a.enhance,a.ridge,a.centroid))
     try:
         for bid,n,msg in pool.imap_unordered(_process, tasks):
             done+=1

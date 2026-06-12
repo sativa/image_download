@@ -29,57 +29,60 @@ def main():
     ap.add_argument("--in", dest="inp", default=IN)
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--tag", default="FINAL")              # 预览图后缀
+    ap.add_argument("--no-dissolve", action="store_true")  # centroid质心输出已无缝, 跳过分幅缝合
     A = ap.parse_args()
     globals()["IN"] = A.inp; globals()["OUT"] = A.out; globals()["TAG"] = A.tag
     t0 = time.time()
     g = gpd.read_parquet(A.inp).to_crs(UTM).reset_index(drop=True)
     g["geometry"] = g.geometry.buffer(0)
     g = g[~g.geometry.is_empty & g.geometry.notna()].reset_index(drop=True)
-    N = len(g); b = g.geometry.bounds.values; lab = g["label"].values; blk = g["block"].values
+    N = len(g); lab = g["label"].values
     print(f"[finalize] {N} parcels loaded ({time.time()-t0:.0f}s)", flush=True)
 
-    # 分幅线 = 各块外框边
-    bb = {}
-    for k in np.unique(blk):
-        idx = np.where(blk == k)[0]; bx = b[idx]
-        bb[k] = (bx[:, 0].min(), bx[:, 1].min(), bx[:, 2].max(), bx[:, 3].max())
-    xl = np.array(sorted({round(v[0], 1) for v in bb.values()} | {round(v[2], 1) for v in bb.values()}))
-    yl = np.array(sorted({round(v[1], 1) for v in bb.values()} | {round(v[3], 1) for v in bb.values()}))
-
-    def near(lo, hi, lines):
-        return np.min(np.abs(lines - lo)) < TOL or np.min(np.abs(lines - hi)) < TOL
-    cand = [i for i in range(N) if near(b[i, 0], b[i, 2], xl) or near(b[i, 1], b[i, 3], yl)]
-    print(f"[finalize] {len(cand)} boundary-candidate parcels", flush=True)
-
-    # 跨块 + 同类 + 相邻 -> union-find(只缝分幅切开的, 块内不并)
-    cg = g.iloc[cand].copy(); cg["geometry"] = cg.geometry.buffer(TOL / 2); cg["ci"] = cand
-    j = gpd.sjoin(cg[["geometry", "ci"]], cg[["geometry", "ci"]], predicate="intersects", how="inner")
-    par = np.arange(N)
-
-    def find(x):
-        while par[x] != x:
-            par[x] = par[par[x]]; x = par[x]
-        return x
-    m = 0
-    for a, c in zip(j["ci_left"].values, j["ci_right"].values):
-        if a >= c:
-            continue
-        if blk[a] != blk[c] and lab[a] == lab[c]:                  # 仅跨块同类
-            ra, rc = find(a), find(c)
-            if ra != rc:
-                par[ra] = rc; m += 1
-    root = np.array([find(i) for i in range(N)]); grp = defaultdict(list)
-    for i in range(N):
-        grp[root[i]].append(i)
-    gv = g.geometry.values; rows = []
-    for r, idxs in grp.items():
-        i0 = idxs[0]
-        gm = gv[i0] if len(idxs) == 1 else unary_union([gv[k] for k in idxs])   # 精确贴合 -> 干净融合
-        rows.append((gm, lab[i0]))
-    out = gpd.GeoDataFrame({"label": [x[1] for x in rows]}, geometry=[x[0] for x in rows], crs=UTM)
-    out = out.explode(index_parts=False).reset_index(drop=True)
-    out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
-    print(f"[finalize] 分幅缝合 {N} -> {len(out)} (merges={m}, {time.time()-t0:.0f}s)", flush=True)
+    if A.no_dissolve:                                             # centroid质心输出已无缝 -> 每地块独立, 不缝合(避免误并相邻不同田块)
+        out = gpd.GeoDataFrame({"label": lab}, geometry=g.geometry.values, crs=UTM)
+        out = out.explode(index_parts=False).reset_index(drop=True)
+        out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
+        print(f"[finalize] 跳过缝合(centroid已无缝): {len(out)} parcels ({time.time()-t0:.0f}s)", flush=True)
+    else:
+        b = g.geometry.bounds.values; blk = g["block"].values
+        bb = {}                                                   # 分幅线 = 各块外框边
+        for k in np.unique(blk):
+            idx = np.where(blk == k)[0]; bx = b[idx]
+            bb[k] = (bx[:, 0].min(), bx[:, 1].min(), bx[:, 2].max(), bx[:, 3].max())
+        xl = np.array(sorted({round(v[0], 1) for v in bb.values()} | {round(v[2], 1) for v in bb.values()}))
+        yl = np.array(sorted({round(v[1], 1) for v in bb.values()} | {round(v[3], 1) for v in bb.values()}))
+        def near(lo, hi, lines):
+            return np.min(np.abs(lines - lo)) < TOL or np.min(np.abs(lines - hi)) < TOL
+        cand = [i for i in range(N) if near(b[i, 0], b[i, 2], xl) or near(b[i, 1], b[i, 3], yl)]
+        print(f"[finalize] {len(cand)} boundary-candidate parcels", flush=True)
+        cg = g.iloc[cand].copy(); cg["geometry"] = cg.geometry.buffer(TOL / 2); cg["ci"] = cand
+        j = gpd.sjoin(cg[["geometry", "ci"]], cg[["geometry", "ci"]], predicate="intersects", how="inner")
+        par = np.arange(N)
+        def find(x):
+            while par[x] != x:
+                par[x] = par[par[x]]; x = par[x]
+            return x
+        m = 0
+        for a, c in zip(j["ci_left"].values, j["ci_right"].values):
+            if a >= c:
+                continue
+            if blk[a] != blk[c] and lab[a] == lab[c]:
+                ra, rc = find(a), find(c)
+                if ra != rc:
+                    par[ra] = rc; m += 1
+        root = np.array([find(i) for i in range(N)]); grp = defaultdict(list)
+        for i in range(N):
+            grp[root[i]].append(i)
+        gv = g.geometry.values; rows = []
+        for r, idxs in grp.items():
+            i0 = idxs[0]
+            gm = gv[i0] if len(idxs) == 1 else unary_union([gv[k] for k in idxs])
+            rows.append((gm, lab[i0]))
+        out = gpd.GeoDataFrame({"label": [x[1] for x in rows]}, geometry=[x[0] for x in rows], crs=UTM)
+        out = out.explode(index_parts=False).reset_index(drop=True)
+        out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
+        print(f"[finalize] 分幅缝合 {N} -> {len(out)} (merges={m}, {time.time()-t0:.0f}s)", flush=True)
 
     # 平滑(合并之后, 对最终边界整体做; smooth_geom 跳过 >120 点大环避免抖动)
     out["geometry"] = out.geometry.apply(smooth_geom)
