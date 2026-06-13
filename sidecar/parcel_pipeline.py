@@ -1,0 +1,447 @@
+"""parcel_pipeline — region-agnostic 1m 地块矢量管线(模型 -> 无缝矢量成品).
+
+把榆中专用链(yz_global_ffl + yz_smooth2 + yz_postproc)通用化成 **不绑任何县/类别/降采样** 的可复用管线。
+任意 1m mosaic + 四头 BDDF 权重 -> 全县无缝 7 类地块 GeoParquet。
+
+阶段(都复用现有算法函数, 不重写):
+  1. 全局 /N watershed 累加器推理(从 yz_global_ffl 抽出, **去掉 FFL 帧场**, 保留 cls/dist/bnd)。
+     多 GPU 行带并行, 每窗 softmax(cls)/sigmoid(dist,bnd) -> /N area-resize -> Hann 累加到全局累加器。
+     -> dino_parcel_export.build_idmap(ridge watershed) -> 全局 idmap(无块无缝 partition)。
+  2. 全县整体矢量化 + 平滑(从 yz_smooth2 抽出): shapes 出干净分区 ->
+     coverage_simplify(tol) 全县去 /N 阶梯 -> 一次 topojson.Topology -> 每 arc Chaikin(端点固定) -> 无缝。
+  3. 可选裁县界: boundary 给了 -> 真几何 intersection 裁; 否则跳过。
+  4. postproc.run_postproc 标准收尾(sliver / gap-hole / invalid / standardize)。
+
+为何这样设计(被否方向见 PIPELINE.md):
+  - **不用 FFL 帧场**: 帧场正则使多边形过直 + 逐实例重叠, 改 dist/bnd ridge watershed + 拓扑保持(topojson)。
+  - **全局累加器** 而非 per-cell / 分块: 分块切线留白缝; per-cell 慢且有 cell 缝。全局一张 /N 网格累加 -> 无缝。
+  - **全县一次 topojson + Chaikin arc**: 共享边只存一份 arc, Chaikin 后两侧逐点一致 -> 零重叠无缝。
+
+CLI:
+  python parcel_pipeline.py \
+    --mosaic <tif> --weights <pt> --backbone <dir> \
+    --boundary <parquet|none> --out <parquet> \
+    --downscale 4 --smooth-iters 2 --classes classes.json --gpus 0,1,2,3
+
+classes.json: list[[id, label_zh, label_en, [r,g,b]], ...] (默认 = dino_parcel_export.CLASSES, 7 类)。
+"""
+from __future__ import annotations
+import argparse, json, math, os, sys, time
+from pathlib import Path
+
+import numpy as np
+
+SIDECAR = str(Path(__file__).resolve().parent)
+CS = 448          # window size
+STRIDE = 224      # 50% overlap
+
+
+def make_hann(cs):
+    return np.maximum(np.outer(np.hanning(cs), np.hanning(cs)), 1e-3).astype(np.float32)
+
+
+# ===========================================================================
+# 阶段 1: 全局 /N watershed 累加器推理(去 FFL, 保 cls/dist/bnd)
+# ===========================================================================
+def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_dict, log_path):
+    """一条行带的滑窗推理 worker(在子进程内, 绑定一张 GPU)。
+    与 yz_global_ffl.band_worker 同算法, 去掉第4头帧场累加器。"""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    import rasterio
+    from rasterio.windows import Window
+    import cv2
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoModel
+    from train_dino_1m_v3 import DinoV3FreqUNetBDDF, enhance6
+    from train_dino_1m import norm6
+
+    cs4 = CS // ds
+    hann4 = make_hann(cs4)
+
+    def log(msg):
+        with open(log_path, "a") as f:
+            f.write("[w%d gpu%d] %s\n" % (wid, gpu, msg)); f.flush()
+
+    t0 = time.time()
+    d3 = AutoModel.from_pretrained(backbone, local_files_only=True)
+    m = DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).cuda()
+    sd = torch.load(weights, map_location="cuda", weights_only=True); msd = m.state_dict()
+    m.load_state_dict({k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}, strict=False)
+    m.eval()
+    log("model resident (%.0fs)" % (time.time() - t0))
+
+    H4 = math.ceil(H / ds); W4 = math.ceil(W / ds)
+    acc_cls = np.zeros((9, H4, W4), np.float32)
+    acc_dist = np.zeros((H4, W4), np.float32)
+    acc_bnd = np.zeros((H4, W4), np.float32)
+    cnt = np.zeros((H4, W4), np.float32)
+
+    ys_all = list(range(0, max(1, H - CS + 1), STRIDE))
+    if ys_all[-1] != H - CS:
+        ys_all.append(max(0, H - CS))
+    xs_all = list(range(0, max(1, W - CS + 1), STRIDE))
+    if xs_all[-1] != W - CS:
+        xs_all.append(max(0, W - CS))
+    ys = [t for t in ys_all if row0 <= t < row1]
+    ndvi = np.zeros((5, CS, CS), np.float32)
+
+    src = rasterio.open(mosaic)
+    nwin = len(ys) * len(xs_all); done = 0
+    log("band rows [%d,%d) -> %d y x %d x = %d windows" % (row0, row1, len(ys), len(xs_all), nwin))
+    for t in ys:
+        rowblk = src.read([1, 2, 3], window=Window(0, t, W, CS))
+        for l in xs_all:
+            tile = rowblk[:, :, l:l + CS]
+            ch, cw = tile.shape[1], tile.shape[2]
+            if ch < CS or cw < CS:
+                pad = np.zeros((3, CS, CS), np.uint8); pad[:, :ch, :cw] = tile; tile = pad
+            rgb = np.ascontiguousarray(tile).astype(np.uint8)
+            x6 = np.concatenate([rgb, rgb], 0)
+            xc = np.concatenate([norm6(enhance6(x6)), ndvi], 0)
+            xb = torch.from_numpy(xc).unsqueeze(0).cuda()
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
+                o = m(xb); cl, bn, dsh = o[0], o[1], o[2]   # 忽略 o[3] 帧场
+                if cl.shape[-2:] != (CS, CS):
+                    cl = F.interpolate(cl, (CS, CS), mode="bilinear", align_corners=False)
+                    bn = F.interpolate(bn, (CS, CS), mode="bilinear", align_corners=False)
+                    dsh = F.interpolate(dsh, (CS, CS), mode="bilinear", align_corners=False)
+                pr = torch.softmax(cl.float(), 1)[0].cpu().numpy()
+                pd = torch.sigmoid(dsh.float())[0, 0].cpu().numpy()
+                pb = torch.sigmoid(bn.float())[0, 0].cpu().numpy()
+            pr4 = np.stack([cv2.resize(pr[c], (cs4, cs4), interpolation=cv2.INTER_AREA) for c in range(9)], 0)
+            pd4 = cv2.resize(pd, (cs4, cs4), interpolation=cv2.INTER_AREA)
+            pb4 = cv2.resize(pb, (cs4, cs4), interpolation=cv2.INTER_AREA)
+            t4 = t // ds; l4 = l // ds
+            h4 = min(cs4, H4 - t4); w4 = min(cs4, W4 - l4)
+            if h4 <= 0 or w4 <= 0:
+                continue
+            wn = hann4[:h4, :w4]
+            acc_cls[:, t4:t4 + h4, l4:l4 + w4] += pr4[:, :h4, :w4] * wn
+            acc_dist[t4:t4 + h4, l4:l4 + w4] += pd4[:h4, :w4] * wn
+            acc_bnd[t4:t4 + h4, l4:l4 + w4] += pb4[:h4, :w4] * wn
+            cnt[t4:t4 + h4, l4:l4 + w4] += wn
+            done += 1
+        if (ys.index(t) + 1) % 5 == 0 or t == ys[-1]:
+            r = (time.time() - t0) / max(done, 1)
+            log("  %d/%d win | %.2fs/win | ETA %.0fmin" % (done, nwin, r, r * (nwin - done) / 60))
+    src.close()
+    shm = "/dev/shm/parcelpipe_w%d.npz" % wid
+    if not os.path.isdir("/dev/shm"):
+        shm = "/tmp/parcelpipe_w%d.npz" % wid
+    np.savez(shm, acc_cls=acc_cls, acc_dist=acc_dist, acc_bnd=acc_bnd, cnt=cnt)
+    ret_dict[wid] = shm
+    log("DONE %d windows -> %s (%.0fmin)" % (done, shm, (time.time() - t0) / 60))
+
+
+def infer_global(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipeline_infer.log"):
+    """全局 /N 累加器推理 -> 返回 (cls(9,H4,W4), dist(H4,W4), bnd(H4,W4), tr4, crs, cov)。
+
+    多 GPU 行带并行(spawn), 每带一个 worker -> 主进程归并 sum/cnt。
+    单 GPU 列表(如 ['0'])也支持 -> 单带串行。
+    """
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    import rasterio
+    from affine import Affine
+    import torch.multiprocessing as mp
+
+    src = rasterio.open(mosaic)
+    H, W = src.height, src.width
+    base_tr = src.transform; crs = src.crs
+    src.close()
+    H4 = math.ceil(H / ds); W4 = math.ceil(W / ds)
+    tr4 = base_tr * Affine.scale(ds, ds)
+    print("[infer] mosaic %dx%d -> /%d grid %dx%d | tr4=%s" % (H, W, ds, H4, W4, tr4), flush=True)
+
+    ng = len(gpus)
+    ys_all = list(range(0, max(1, H - CS + 1), STRIDE))
+    if ys_all[-1] != H - CS:
+        ys_all.append(max(0, H - CS))
+    per = math.ceil(len(ys_all) / ng)
+    bands = []
+    for i in range(ng):
+        yi = ys_all[i * per:(i + 1) * per]
+        if yi:
+            bands.append((yi[0], yi[-1] + 1))
+    print("[infer] %d row-windows -> %d bands: %s" % (len(ys_all), len(bands), bands), flush=True)
+    open(log_path, "w").write("[infer] start %dx%d /%d %dx%d bands=%s\n" % (H, W, ds, H4, W4, bands))
+
+    ctx = mp.get_context("spawn"); mgr = ctx.Manager(); ret = mgr.dict()
+    procs = []; t0 = time.time()
+    for wid, (r0, r1) in enumerate(bands):
+        p = ctx.Process(target=_band_worker,
+                        args=(wid, gpus[wid % ng], r0, r1, H, W, mosaic, weights, backbone, ds, ret, log_path))
+        p.start(); procs.append(p)
+    for p in procs:
+        p.join()
+    nb = len(bands)
+    if len(ret) != nb:
+        raise RuntimeError("infer FAIL: only %d/%d bands returned (exitcodes=%s)" %
+                           (len(ret), nb, [p.exitcode for p in procs]))
+
+    acc_cls = np.zeros((9, H4, W4), np.float32)
+    acc_dist = np.zeros((H4, W4), np.float32)
+    acc_bnd = np.zeros((H4, W4), np.float32)
+    cnt = np.zeros((H4, W4), np.float32)
+    for wid in range(nb):
+        z = np.load(ret[wid])
+        acc_cls += z["acc_cls"]; acc_dist += z["acc_dist"]; acc_bnd += z["acc_bnd"]; cnt += z["cnt"]
+        del z; os.remove(ret[wid])
+    cnt = np.maximum(cnt, 1e-6)
+    cls = acc_cls / cnt; dist = acc_dist / cnt; bnd = acc_bnd / cnt
+    cov = float((cnt > 1e-3).mean())
+    print("[infer] merged. /%d cov=%.4f cls%s (%.0fmin)" % (ds, cov, cls.shape, (time.time() - t0) / 60), flush=True)
+    return cls, dist, bnd, tr4, crs, cov
+
+
+def idmap_from_heads(cls, dist, bnd, min_dist=20, peak_thr=0.4, min_area_px=200, ridge=True):
+    """全局 idmap: cropland/orchard 用 dist-peak ridge watershed, 其余类用 argmax 连通域。
+    复用 dino_parcel_export.build_idmap(全局 /N 网格, downscale=1)。返回 (idmap, cls_of)。"""
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    from dino_parcel_export import build_idmap
+
+    class Pp:
+        pass
+    Pp.min_dist = min_dist; Pp.peak_thr = peak_thr; Pp.min_area_px = min_area_px
+    Pp.ridge = ridge; Pp.downscale = 1; Pp.smooth_iters = 1
+    t0 = time.time()
+    idmap, cls_of = build_idmap(cls, dist, bnd, Pp)
+    print("[idmap] build_idmap: %d instances (%.0fmin)" % (len(cls_of), (time.time() - t0) / 60), flush=True)
+    return idmap, cls_of
+
+
+# ===========================================================================
+# 阶段 2: 全县整体矢量化 + Chaikin 平滑(region-agnostic, 从 yz_smooth2 抽出)
+# ===========================================================================
+def chaikin_arc(arc, iters):
+    """Chaikin corner-cutting on a single arc; FIRST & LAST point(=nodes) FIXED。
+    arc: list of [x,y]。每段用 1/4、3/4 切角点替换, 迭代 iters 次; arc 端点(节点)不动 -> 共享边逐点一致 -> 无缝。"""
+    pts = np.asarray(arc, dtype=np.float64)
+    if iters <= 0 or len(pts) < 3:
+        return arc
+    p = pts
+    for _ in range(iters):
+        if len(p) < 3:
+            break
+        a = p[:-1]; b = p[1:]
+        q = a + 0.25 * (b - a)
+        r = a + 0.75 * (b - a)
+        inner = np.empty((2 * len(q), 2), dtype=np.float64)
+        inner[0::2] = q; inner[1::2] = r
+        new = np.empty((len(inner) + 2, 2), dtype=np.float64)
+        new[0] = p[0]; new[1:-1] = inner; new[-1] = p[-1]
+        p = new
+    return p.tolist()
+
+
+def vectorize_idmap(idmap, cls_of, tr4, crs):
+    """全局 idmap -> 干净分区 GeoDataFrame(class_id + geometry), CRS=源 CRS。
+    用 rasterio.features.shapes 出多边形(无缝 coverage), 修无效, explode 单 Polygon。"""
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    import rasterio.features
+    from shapely.geometry import shape as _shape
+    import geopandas as gpd
+
+    rows = []
+    for geom, val in rasterio.features.shapes(idmap.astype(np.int32), mask=idmap > 0,
+                                              connectivity=8, transform=tr4):
+        c = cls_of.get(int(val))
+        if not c:
+            continue
+        g = _shape(geom)
+        if not g.is_valid:
+            g = g.buffer(0)
+        if g.is_empty:
+            continue
+        if g.geom_type == "Polygon":
+            rows.append({"parcel_id": int(val), "class_id": int(c), "geometry": g})
+        else:
+            for pp in getattr(g, "geoms", []):
+                if getattr(pp, "geom_type", "") == "Polygon" and not pp.is_empty and pp.area > 0:
+                    rows.append({"parcel_id": int(val), "class_id": int(c), "geometry": pp})
+    gdf = gpd.GeoDataFrame(rows, geometry="geometry", crs=crs)
+    return gdf
+
+
+def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
+    """全县整体拓扑保持平滑(region-agnostic, 从 yz_smooth2 抽出)。
+
+    gdf(class_id+geometry) ->(work_crs)
+      coverage_simplify(tol) 全县整体 去 /N 阶梯, 共享边精确一致, 顶点降 ~2x
+      -> topojson.Topology(prequantize=False, shared_coords=False) 全县一次(共享边一份 arc)
+      -> 每 arc Chaikin(端点固定) -> to_gdf 重建 -> 共享边逐点一致 -> 零重叠无缝。
+    返回平滑后 GeoDataFrame(work_crs, 带 class_id)。
+    """
+    import geopandas as gpd
+    from shapely import make_valid, coverage_simplify
+    import topojson
+
+    g = gdf.to_crs(work_crs).reset_index(drop=True)
+    g["geometry"] = g.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
+    g = g[~g.geometry.is_empty & g.geometry.notna()].reset_index(drop=True)
+    t0 = time.time()
+    simp = coverage_simplify(g.geometry.values, tolerance=tol, simplify_boundary=True)
+    simp = np.array([sg if (sg is not None and sg.is_valid) else make_valid(sg) for sg in simp], dtype=object)
+    g2 = gpd.GeoDataFrame({"class_id": g["class_id"].values},
+                          geometry=gpd.GeoSeries(simp, crs=work_crs))
+    g2 = g2[~g2.geometry.is_empty & g2.geometry.notna()].reset_index(drop=True)
+    print("[smooth] coverage_simplify(tol=%s) %.0fs | %d polys" % (tol, time.time() - t0, len(g2)), flush=True)
+
+    t1 = time.time()
+    topo = topojson.Topology(g2, prequantize=False, shared_coords=False)
+    n_arcs = len(topo.output["arcs"])
+    print("[smooth] topojson built: %d arcs (%.0fs)" % (n_arcs, time.time() - t1), flush=True)
+
+    if iters > 0:
+        topo.output["arcs"] = [chaikin_arc(arc, iters) for arc in topo.output["arcs"]]
+    out = topo.to_gdf(crs=work_crs)
+    out["geometry"] = out.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
+    out = out[~out.geometry.is_empty & out.geometry.notna()].reset_index(drop=True)
+    print("[smooth] Chaikin(iters=%d) + rebuild done (%.0fs) | %d polys" %
+          (iters, time.time() - t1, len(out)), flush=True)
+    return out
+
+
+# ===========================================================================
+# 阶段 3: 可选裁县界(region-agnostic)
+# ===========================================================================
+def clip_to_boundary(gdf, boundary_geom, utm="EPSG:32648"):
+    """真几何 intersection 裁到 boundary_geom(任意闭合县界几何)。
+    boundary_geom: shapely 几何(任意 CRS 由 boundary_crs 处理 -> 这里假定调用方已转好或在 utm)。
+    gdf 任意 CRS -> utm 做裁切 -> 返回 utm 下裁好的单 Polygon GeoDataFrame。"""
+    import geopandas as gpd
+    import pandas as pd
+    from shapely import make_valid
+
+    g2u = gdf.to_crs(utm).reset_index(drop=True)
+    cbgeo = make_valid(boundary_geom)
+    minx, miny, maxx, maxy = cbgeo.bounds
+    b = g2u.geometry.bounds.values
+    keep = ~((b[:, 2] < minx) | (b[:, 0] > maxx) | (b[:, 3] < miny) | (b[:, 1] > maxy))
+    g2u = g2u[keep].reset_index(drop=True)
+    cov = g2u.geometry.covered_by(cbgeo)
+    inside = g2u[cov].copy()
+    edge = g2u[~cov].copy()
+    rows = []
+    for geom, cid in zip(edge.geometry.values, edge["class_id"].values):
+        try:
+            inter = geom.intersection(cbgeo)
+        except Exception:
+            try:
+                inter = make_valid(geom).intersection(cbgeo)
+            except Exception:
+                continue
+        if inter.is_empty or inter.area <= 0:
+            continue
+        rows.append({"class_id": cid, "geometry": inter})
+    ec = gpd.GeoDataFrame(rows, crs=utm) if rows else gpd.GeoDataFrame(
+        {"class_id": [], "geometry": []}, crs=utm)
+    out = gpd.GeoDataFrame(pd.concat([inside[["class_id", "geometry"]], ec[["class_id", "geometry"]]],
+                                     ignore_index=True), crs=utm)
+    out = out.explode(index_parts=False).reset_index(drop=True)
+    out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
+    out["geometry"] = out.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
+    out = out[~out.geometry.is_empty & out.geometry.notna()].reset_index(drop=True)
+    return out
+
+
+# ===========================================================================
+# 端到端编排
+# ===========================================================================
+def default_classes():
+    """默认 7 类 schema = dino_parcel_export.CLASSES。"""
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    from dino_parcel_export import CLASSES
+    return [[c[0], c[1], c[2], list(c[3])] for c in CLASSES]
+
+
+def load_boundary(boundary_arg, utm="EPSG:32648"):
+    """boundary 参数 -> (utm 下的) 单个 shapely 几何, 或 None。
+    支持 parquet / geojson / 'none'。多 feature -> union。"""
+    if not boundary_arg or boundary_arg.lower() == "none":
+        return None
+    import geopandas as gpd
+    from shapely.ops import unary_union
+    from shapely import make_valid
+    gb = gpd.read_file(boundary_arg) if not boundary_arg.endswith(".parquet") else gpd.read_parquet(boundary_arg)
+    gb = gb.to_crs(utm)
+    return make_valid(unary_union(gb.geometry.values))
+
+
+def run_pipeline(mosaic, weights, backbone, out, boundary=None, downscale=4, smooth_iters=2,
+                 classes=None, gpus=("0", "1", "2", "3"), utm="EPSG:32648",
+                 min_dist=20, peak_thr=0.4, min_area_px=200, ridge=True, tol=5.0,
+                 save_intermediate=None):
+    """完整通用管线: mosaic -> 无缝标准矢量 GeoParquet。返回 (out_gdf, report)。"""
+    classes = classes or default_classes()
+    t0 = time.time()
+    # 1) 全局推理 + idmap
+    cls, dist, bnd, tr4, crs, cov = infer_global(mosaic, weights, backbone, downscale, list(gpus))
+    idmap, cls_of = idmap_from_heads(cls, dist, bnd, min_dist, peak_thr, min_area_px, ridge)
+    del cls, dist, bnd
+    if save_intermediate:
+        np.save(str(Path(save_intermediate) / "idmap.npy"), idmap.astype(np.int32))
+    # 2) 矢量化 + 平滑
+    raw = vectorize_idmap(idmap, cls_of, tr4, crs)
+    del idmap
+    print("[pipeline] vectorized raw: %d polys" % len(raw), flush=True)
+    smoothed = smooth_coverage(raw, tol=tol, iters=smooth_iters)
+    # 3) 可选裁界
+    bnd_geom = load_boundary(boundary, utm) if isinstance(boundary, str) else boundary
+    if bnd_geom is not None:
+        clipped = clip_to_boundary(smoothed, bnd_geom, utm=utm)
+        print("[pipeline] clipped to boundary: %d polys" % len(clipped), flush=True)
+    else:
+        clipped = smoothed.to_crs(utm)
+        print("[pipeline] no boundary -> skip clip", flush=True)
+    # 4) 标准后处理
+    import postproc
+    final, report = postproc.run_postproc(clipped, classes, boundary=bnd_geom, utm=utm)
+    final.to_parquet(out)
+    report["out"] = out
+    report["cov"] = cov
+    report["total_min"] = (time.time() - t0) / 60
+    from collections import Counter
+    cc = Counter(final["label"])
+    print("[pipeline] DONE %.0fmin -> %s | %d polys | %s" %
+          (report["total_min"], out, len(final), dict(cc)), flush=True)
+    return final, report
+
+
+def main():
+    ap = argparse.ArgumentParser(description="region-agnostic 1m parcel vector pipeline")
+    ap.add_argument("--mosaic", required=True, help="1m RGB mosaic GeoTIFF")
+    ap.add_argument("--weights", required=True, help="四头 BDDF 权重 .pt")
+    ap.add_argument("--backbone", required=True, help="DINOv3-Sat backbone dir")
+    ap.add_argument("--out", required=True, help="output GeoParquet")
+    ap.add_argument("--boundary", default="none", help="县界 parquet/geojson 或 none")
+    ap.add_argument("--downscale", type=int, default=4, help="全局累加器 /N 网格(大 mosaic 一遍过)")
+    ap.add_argument("--smooth-iters", type=int, default=2, help="Chaikin 迭代次数(0=off)")
+    ap.add_argument("--tol", type=float, default=5.0, help="coverage_simplify 容差(米, 3857)")
+    ap.add_argument("--classes", default="", help="classes.json (list[[id,zh,en,[r,g,b]]]); 空=默认7类")
+    ap.add_argument("--gpus", default="0,1,2,3")
+    ap.add_argument("--utm", default="EPSG:32648")
+    ap.add_argument("--min-dist", type=int, default=20)
+    ap.add_argument("--peak-thr", type=float, default=0.4)
+    ap.add_argument("--min-area-px", type=int, default=200)
+    ap.add_argument("--no-ridge", action="store_true")
+    ap.add_argument("--save-intermediate", default="", help="保存 idmap.npy 的目录(可选)")
+    a = ap.parse_args()
+    classes = json.loads(Path(a.classes).read_text()) if a.classes else None
+    si = a.save_intermediate or None
+    if si:
+        os.makedirs(si, exist_ok=True)
+    run_pipeline(a.mosaic, a.weights, a.backbone, a.out, boundary=a.boundary,
+                 downscale=a.downscale, smooth_iters=a.smooth_iters, classes=classes,
+                 gpus=a.gpus.split(","), utm=a.utm, min_dist=a.min_dist, peak_thr=a.peak_thr,
+                 min_area_px=a.min_area_px, ridge=not a.no_ridge, tol=a.tol, save_intermediate=si)
+
+
+if __name__ == "__main__":
+    main()
