@@ -10,7 +10,9 @@
   2. 全县整体矢量化 + 平滑(从 yz_smooth2 抽出): shapes 出干净分区 ->
      coverage_simplify(tol) 全县去 /N 阶梯 -> 一次 topojson.Topology -> 每 arc Chaikin(端点固定) -> 无缝。
   3. 可选裁县界: boundary 给了 -> 真几何 intersection 裁; 否则跳过。
-  4. postproc.run_postproc 标准收尾(sliver / gap-hole / invalid / standardize)。
+  4. postproc.run_postproc 标准收尾(sliver / gap-hole / tiny-hole / invalid / standardize):
+     强化的 eliminate_slivers(宽度判据 w<1m 并入邻块, 治 Chaikin 悬空线段) +
+     drop_tiny_holes(删 <10m² 退化微洞, 治微楔/小环) 默认参数即够狠, 县级输出自动干净。
 
 为何这样设计(被否方向见 PIPELINE.md):
   - **不用 FFL 帧场**: 帧场正则使多边形过直 + 逐实例重叠, 改 dist/bnd ridge watershed + 拓扑保持(topojson)。

@@ -30,8 +30,8 @@ if _SC not in _sys.path:
 # 向后兼容 re-export: 算法单一真源在区域无关的 postproc.py。
 from postproc import (  # noqa: F401
     is_sliver, eliminate_slivers, find_slivers,
-    fill_gaps_holes, fix_invalid, standardize, run_postproc,
+    fill_gaps_holes, drop_tiny_holes, fix_invalid, standardize, run_postproc,
 )
 
 __all__ = ["is_sliver", "eliminate_slivers", "find_slivers",
-           "fill_gaps_holes", "fix_invalid", "standardize", "run_postproc"]
+           "fill_gaps_holes", "drop_tiny_holes", "fix_invalid", "standardize", "run_postproc"]
