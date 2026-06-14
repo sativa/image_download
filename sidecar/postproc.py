@@ -235,7 +235,8 @@ def find_slivers(gdf, w_min=1.5, sliver_max_area=100.0, min_area=None):
 # ---------------------------------------------------------------------------
 # 空白图斑 / 空心洞 修补
 # ---------------------------------------------------------------------------
-def fill_gaps_holes(gdf, boundary=None, min_gap_area=1.0, attr_cols=("class_id", "label", "label_en", "rgb_hex"),
+def fill_gaps_holes(gdf, boundary=None, min_gap_area=1.0, vertex_cap=100000,
+                    attr_cols=("class_id", "label", "label_en", "rgb_hex"),
                     verbose=True):
     """修补"空白图斑": 图斑间空隙 + 县界内未覆盖区 + 空心洞 -> 按邻块**多数票**填补。
 
@@ -247,12 +248,25 @@ def fill_gaps_holes(gdf, boundary=None, min_gap_area=1.0, attr_cols=("class_id",
 
     gdf 须为米制 CRS。boundary: 单个 shapely 几何(已在同 CRS), None 则只修内部空心洞。
     返回 (out_gdf, report)。
+
+    ⚠️ 性能护栏: 本步靠全量 `unary_union` 求 coverage 并集来找空隙/空心洞。当存在**超大图斑**
+    (顶点 >= vertex_cap, 如 Chaikin 后 5M 顶点的背景图斑)时, 该 union 要数分钟且无 boundary 时
+    收益有限(内部空心洞交给 drop_tiny_holes 清更稳)。故: **存在超大图斑且 boundary 为 None ->
+    直接跳过本步**(返回原 gdf, 不做 union)。
     """
     g = gdf.copy().reset_index(drop=True)
     g["geometry"] = g.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
     g = g[~g.geometry.is_empty & g.geometry.notna()].reset_index(drop=True)
     report = {"n_before": int(len(g)), "gaps_found": 0, "gaps_filled": 0,
-              "gap_area_m2": 0.0, "min_gap_area": min_gap_area}
+              "gap_area_m2": 0.0, "min_gap_area": min_gap_area, "skipped": False}
+
+    if boundary is None and bool((shapely.get_num_coordinates(g.geometry.values) >= vertex_cap).any()):
+        report["skipped"] = True
+        report["n_after"] = int(len(g))
+        if verbose:
+            print("  [gap-hole] skip: 存在超大图斑且无 boundary -> 全量 union 不经济, "
+                  "空心洞由 drop_tiny_holes 处理", flush=True)
+        return g, report
 
     union = unary_union(g.geometry.values)
     gaps = []
