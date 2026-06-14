@@ -142,11 +142,17 @@ OPTIONS:
                          3-band, ~2x) | none (uncompressed RGBA 4-band)
                          [default: jpeg]
     --quality <Q>        JPEG quality 1..100 (compress=jpeg only) [default: 95]
-    --classify [B]       After downloading, classify every cell with the trained
-                         model (python sidecar) and write per-parcel polygons
-                         (GeoParquet+GPKG+GeoJSON). B = parcel_dist (default,
-                         best: dist-peak + frame-field regularized vectors) |
+    --classify [B]       After downloading, classify with the trained model.
+                         Trained backends (parcel_dist|cropland|parcel_bh|parcel|
+                         landcover) now produce ONE SEAMLESS COUNTY coverage:
+                         all cells are merged into a single mosaic, run through a
+                         global-watershed inference + topology-preserving vectorise
+                         + curve smoothing (Chaikin) + standard postproc (sliver/
+                         gap-hole/invalid) -> <out>/county_seamless.parquet. This
+                         replaces the old per-cell (cell-seamed) output.
+                         B = parcel_dist (default, best: dist-peak watershed) |
                          cropland | parcel_bh | parcel | landcover.
+                         (Pipeline env: IMG_PIPELINE_PYTHON; needs geopandas+topojson.)
     -h, --help           Show this help.
 
 Output: one EPSG:3857 GeoTIFF per cell, named
@@ -394,10 +400,20 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
         started.elapsed().as_secs_f64()
     );
 
-    // Chained classification: run the trained model over every downloaded cell.
+    // Chained classification. Trained (dense) backends now emit ONE seamless county coverage via
+    // parcel_pipeline.py (global watershed + smooth + postproc); single-image backends (slic/sam3/
+    // dino) stay per-cell. The county pipeline merges all downloaded cells into one mosaic — so it
+    // is *not* seamed at cell borders, unlike the old per-cell path.
     let mut classify_failed = 0usize;
     if let Some(backend) = &args.classify {
-        classify_failed = classify_dir(&args.out, backend, &SidecarOpts::from_env());
+        let opts = SidecarOpts::from_env();
+        if is_county_backend(backend) {
+            if !run_county_pipeline(&args.out, backend, &opts) {
+                classify_failed = 1;
+            }
+        } else {
+            classify_failed = classify_dir(&args.out, backend, &opts);
+        }
     }
     if failed > 0 || classify_failed > 0 {
         1
@@ -501,6 +517,10 @@ async fn download_one_cell(
 /// (same vars as the GUI: SAM3_PYTHON / SAM3_SIDECAR_DIR / CROPLAND_BACKBONE / *_WEIGHTS).
 struct SidecarOpts {
     python: String,
+    /// Python env that runs `parcel_pipeline.py` (the seamless county pipeline).
+    /// Needs geopandas + topojson + shapely 2.1 + rasterio + torch; the SAM3 env lacks
+    /// topojson, so this defaults to a fuller env (override with IMG_PIPELINE_PYTHON).
+    pipeline_python: String,
     sidecar_dir: PathBuf,
     backbone: String,
     device: String,
@@ -511,6 +531,8 @@ impl SidecarOpts {
         Self {
             python: std::env::var("SAM3_PYTHON")
                 .unwrap_or_else(|_| "/Users/zhangfeng/D/sam3/sam3_env_py312/bin/python".into()),
+            pipeline_python: std::env::var("IMG_PIPELINE_PYTHON")
+                .unwrap_or_else(|_| "/Users/zhangfeng/miniconda3/envs/py312/bin/python".into()),
             sidecar_dir: std::env::var("SAM3_SIDECAR_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
@@ -521,6 +543,17 @@ impl SidecarOpts {
             device: "auto".into(),
         }
     }
+}
+
+/// Backends whose product is a *county-wide seamless* polygon coverage (trained dense models).
+/// These now run the global-watershed + Chaikin-smooth + postproc pipeline over the whole cell
+/// directory at once (one merged mosaic), instead of the old per-cell (seamed) classification.
+/// Single-image backends (slic/sam3/dino) are NOT in this set — they stay per-cell.
+fn is_county_backend(backend: &str) -> bool {
+    matches!(
+        backend,
+        "parcel_dist" | "landcover" | "cropland" | "parcel_bh" | "parcel"
+    )
 }
 
 /// Default checkpoint per backend (mirrors commands::classify so GUI and CLI agree).
@@ -629,6 +662,71 @@ fn classify_dir(dir: &Path, backend: &str, opts: &SidecarOpts) -> usize {
     failed
 }
 
+/// Run the **seamless county pipeline** (`parcel_pipeline.py`) over a whole cell directory:
+/// rasterio-merge all cell tifs into one mosaic, global-watershed inference, topology-preserving
+/// vectorise + Chaikin smooth + standard postproc (sliver/gap/invalid) -> ONE seamless county
+/// GeoParquet. Replaces the old per-cell (seamed) classification for trained backends.
+///
+/// Output: `<dir>/county_seamless.parquet`. Returns true on success.
+fn run_county_pipeline(dir: &Path, backend: &str, opts: &SidecarOpts) -> bool {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+
+    let out_parquet = dir.join("county_seamless.parquet");
+    if out_parquet.exists() {
+        eprintln!(
+            "[county] {} already exists — skip (delete to re-run)",
+            out_parquet.display()
+        );
+        return true;
+    }
+    eprintln!(
+        "[county] seamless pipeline | backend={backend} | cells-dir={} | python={}",
+        dir.display(),
+        opts.pipeline_python
+    );
+    let mut cmd = Command::new(&opts.pipeline_python);
+    cmd.current_dir(&opts.sidecar_dir)
+        .arg("parcel_pipeline.py")
+        .arg("--cells-dir")
+        .arg(dir)
+        .arg("--weights")
+        .arg(weights_for(backend))
+        .arg("--backbone")
+        .arg(&opts.backbone)
+        .arg("--out")
+        .arg(&out_parquet)
+        .arg("--device")
+        .arg(&opts.device)
+        .arg("--boundary")
+        .arg("none")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[county]   ✗ cannot spawn pipeline ({}): {e}",
+                opts.pipeline_python
+            );
+            return false;
+        }
+    };
+    // Stream the pipeline's stage prints straight through.
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            println!("{line}");
+        }
+    }
+    let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+    if ok {
+        eprintln!("[county]   ✓ wrote {}", out_parquet.display());
+    } else {
+        eprintln!("[county]   ✗ pipeline FAILED");
+    }
+    ok
+}
+
 const CLASSIFY_USAGE: &str = "\
 imagery-downloader classify — run the trained land-cover model on GeoTIFFs
 
@@ -637,10 +735,14 @@ USAGE:
         [--out <dir>] [--device auto|cpu|mps|cuda]
 
 OPTIONS:
-    --input <PATH>   One GeoTIFF, or a directory (every *.tif inside; previous
-                     products *.landform.* are skipped; resumable).
-    --backend <B>    parcel_dist (default — dist-peak watershed + frame-field
-                     regularized polygons) | cropland | parcel_bh | parcel | landcover.
+    --input <PATH>   One GeoTIFF, or a DIRECTORY of cells. For a directory + a
+                     trained backend (parcel_dist|cropland|parcel_bh|parcel|
+                     landcover) the cells are merged into one mosaic and run
+                     through the SEAMLESS county pipeline (global watershed +
+                     smoothing + postproc) -> <dir>/county_seamless.parquet.
+                     Single-image backends (slic/sam3/dino) classify each tif.
+    --backend <B>    parcel_dist (default — dist-peak watershed) | cropland |
+                     parcel_bh | parcel | landcover.
     --out <DIR>      Output dir [default: alongside each input].
     --device <D>     auto (default) | cpu | mps | cuda.
     -h, --help       Show this help.
@@ -698,7 +800,13 @@ pub fn run_classify() -> ! {
         std::process::exit(2);
     };
     let failed = if input.is_dir() {
-        classify_dir(&input, &backend, &opts)
+        // A directory of cells -> trained backends produce one seamless county coverage;
+        // single-image backends (slic/sam3/dino) still classify each tif per-cell.
+        if is_county_backend(&backend) {
+            usize::from(!run_county_pipeline(&input, &backend, &opts))
+        } else {
+            classify_dir(&input, &backend, &opts)
+        }
     } else {
         let dir = out.unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")).to_path_buf());
         let _ = std::fs::create_dir_all(&dir);
