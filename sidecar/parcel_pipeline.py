@@ -17,16 +17,25 @@
   - **全局累加器** 而非 per-cell / 分块: 分块切线留白缝; per-cell 慢且有 cell 缝。全局一张 /N 网格累加 -> 无缝。
   - **全县一次 topojson + Chaikin arc**: 共享边只存一份 arc, Chaikin 后两侧逐点一致 -> 零重叠无缝。
 
+设备可移植(--device auto|cuda|mps|cpu):
+  - cuda  : 多 GPU 行带并行(torch.multiprocessing spawn, 每带绑一张卡), bf16 autocast。
+  - mps/cpu: 单进程整图滑窗推理(无 mp.spawn), fp32(MPS 不支持 bf16 autocast)。
+  auto = cuda > mps > cpu。Mac(M3 Ultra)走 mps。
+
+输入二选一(必给其一):
+  --mosaic <tif>     : 预拼的 1m RGB EPSG:3857 GeoTIFF。
+  --cells-dir <dir>  : 一目录 per-cell EPSG:3857 tif -> rasterio.merge 自带拼接成临时 mosaic 再跑。
+
 CLI:
   python parcel_pipeline.py \
-    --mosaic <tif> --weights <pt> --backbone <dir> \
-    --boundary <parquet|none> --out <parquet> \
+    (--mosaic <tif> | --cells-dir <dir>) --weights <pt> --backbone <dir> \
+    --boundary <parquet|none> --out <parquet> --device auto \
     --downscale 4 --smooth-iters 2 --classes classes.json --gpus 0,1,2,3
 
 classes.json: list[[id, label_zh, label_en, [r,g,b]], ...] (默认 = dino_parcel_export.CLASSES, 7 类)。
 """
 from __future__ import annotations
-import argparse, json, math, os, sys, time
+import argparse, json, math, os, sys, tempfile, time
 from pathlib import Path
 
 import numpy as np
@@ -40,39 +49,92 @@ def make_hann(cs):
     return np.maximum(np.outer(np.hanning(cs), np.hanning(cs)), 1e-3).astype(np.float32)
 
 
+def resolve_device(device):
+    """'auto'|'cuda'|'mps'|'cpu' -> 实际可用设备字符串。auto: cuda>mps>cpu。"""
+    import torch
+    d = (device or "auto").lower()
+    if d == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    if d == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda 但 torch.cuda 不可用")
+    if d == "mps" and not (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
+        raise RuntimeError("--device mps 但 torch.backends.mps 不可用")
+    return d
+
+
+# ===========================================================================
+# 自带拼接: cells-dir -> 临时 mosaic
+# ===========================================================================
+def mosaic_from_cells(cells_dir, out_tif):
+    """一目录 per-cell EPSG:3857 tif -> rasterio.merge.merge 拼成单 mosaic GeoTIFF(out_tif)。
+    只取 *.tif(排除 .landform./_mosaic 产品)。返回 out_tif。"""
+    import rasterio
+    from rasterio.merge import merge as rio_merge
+
+    cells_dir = Path(cells_dir)
+    tifs = sorted(p for p in cells_dir.glob("*.tif")
+                  if ".landform" not in p.name and "_mosaic" not in p.name)
+    if not tifs:
+        raise RuntimeError("--cells-dir %s 下没有可拼接的 *.tif" % cells_dir)
+    print("[mosaic] merging %d cell tifs from %s" % (len(tifs), cells_dir), flush=True)
+    srcs = [rasterio.open(p) for p in tifs]
+    try:
+        mos, mos_tr = rio_merge(srcs)            # (bands, H, W), nodata-aware
+        meta = srcs[0].meta.copy()
+        crs = srcs[0].crs
+    finally:
+        for s in srcs:
+            s.close()
+    # 只保留前 3 波段(RGB); 4 波段 RGBA 输入丢 alpha。
+    nb = min(3, mos.shape[0])
+    mos = mos[:nb]
+    meta.update(driver="GTiff", height=mos.shape[1], width=mos.shape[2],
+                count=nb, transform=mos_tr, crs=crs, dtype=mos.dtype,
+                compress="deflate", tiled=True)
+    with rasterio.open(out_tif, "w", **meta) as dst:
+        dst.write(mos)
+    print("[mosaic] wrote %s (%dx%d, %d bands, crs=%s)" %
+          (out_tif, mos.shape[2], mos.shape[1], nb, crs), flush=True)
+    return out_tif
+
+
 # ===========================================================================
 # 阶段 1: 全局 /N watershed 累加器推理(去 FFL, 保 cls/dist/bnd)
 # ===========================================================================
-def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_dict, log_path):
-    """一条行带的滑窗推理 worker(在子进程内, 绑定一张 GPU)。
-    与 yz_global_ffl.band_worker 同算法, 去掉第4头帧场累加器。"""
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    if SIDECAR not in sys.path:
-        sys.path.insert(0, SIDECAR)
+def _load_model(backbone, weights, device):
+    """加载四头 BDDF 模型到 device(device-agnostic)。返回 eval() 模型。"""
+    import torch
+    from transformers import AutoModel
+    from train_dino_1m_v3 import DinoV3FreqUNetBDDF
+
+    d3 = AutoModel.from_pretrained(backbone, local_files_only=True)
+    m = DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).to(device)
+    sd = torch.load(weights, map_location=device, weights_only=True)
+    msd = m.state_dict()
+    m.load_state_dict({k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}, strict=False)
+    m.eval()
+    return m
+
+
+def _accumulate_band(m, device, row0, row1, H, W, mosaic, ds, log=print):
+    """对行带 [row0,row1) 做滑窗推理, 累加到 (acc_cls, acc_dist, acc_bnd, cnt) /N 网格。
+    device-agnostic: cuda 用 bf16 autocast; mps/cpu 用 fp32(MPS 不支持 bf16 autocast)。
+    返回这条带的 4 个累加数组(全局 /N 尺寸, 带外为 0)。"""
     import rasterio
     from rasterio.windows import Window
     import cv2
     import torch
     import torch.nn.functional as F
-    from transformers import AutoModel
-    from train_dino_1m_v3 import DinoV3FreqUNetBDDF, enhance6
+    from train_dino_1m_v3 import enhance6
     from train_dino_1m import norm6
 
+    is_cuda = str(device).startswith("cuda")
     cs4 = CS // ds
     hann4 = make_hann(cs4)
-
-    def log(msg):
-        with open(log_path, "a") as f:
-            f.write("[w%d gpu%d] %s\n" % (wid, gpu, msg)); f.flush()
-
-    t0 = time.time()
-    d3 = AutoModel.from_pretrained(backbone, local_files_only=True)
-    m = DinoV3FreqUNetBDDF(d3, num_classes=9, in_channels=11, unfreeze_last_n=4).cuda()
-    sd = torch.load(weights, map_location="cuda", weights_only=True); msd = m.state_dict()
-    m.load_state_dict({k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}, strict=False)
-    m.eval()
-    log("model resident (%.0fs)" % (time.time() - t0))
-
     H4 = math.ceil(H / ds); W4 = math.ceil(W / ds)
     acc_cls = np.zeros((9, H4, W4), np.float32)
     acc_dist = np.zeros((H4, W4), np.float32)
@@ -89,7 +151,7 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
     ndvi = np.zeros((5, CS, CS), np.float32)
 
     src = rasterio.open(mosaic)
-    nwin = len(ys) * len(xs_all); done = 0
+    nwin = len(ys) * len(xs_all); done = 0; t0 = time.time()
     log("band rows [%d,%d) -> %d y x %d x = %d windows" % (row0, row1, len(ys), len(xs_all), nwin))
     for t in ys:
         rowblk = src.read([1, 2, 3], window=Window(0, t, W, CS))
@@ -101,9 +163,14 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
             rgb = np.ascontiguousarray(tile).astype(np.uint8)
             x6 = np.concatenate([rgb, rgb], 0)
             xc = np.concatenate([norm6(enhance6(x6)), ndvi], 0)
-            xb = torch.from_numpy(xc).unsqueeze(0).cuda()
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16), torch.no_grad():
-                o = m(xb); cl, bn, dsh = o[0], o[1], o[2]   # 忽略 o[3] 帧场
+            xb = torch.from_numpy(xc).unsqueeze(0).to(device)
+            with torch.no_grad():
+                if is_cuda:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        o = m(xb)
+                else:
+                    o = m(xb)                       # mps/cpu: fp32, no autocast
+                cl, bn, dsh = o[0], o[1], o[2]      # 忽略 o[3] 帧场
                 if cl.shape[-2:] != (CS, CS):
                     cl = F.interpolate(cl, (CS, CS), mode="bilinear", align_corners=False)
                     bn = F.interpolate(bn, (CS, CS), mode="bilinear", align_corners=False)
@@ -128,6 +195,24 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
             r = (time.time() - t0) / max(done, 1)
             log("  %d/%d win | %.2fs/win | ETA %.0fmin" % (done, nwin, r, r * (nwin - done) / 60))
     src.close()
+    return acc_cls, acc_dist, acc_bnd, cnt, done
+
+
+def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_dict, log_path):
+    """一条行带的滑窗推理 worker(在子进程内, 绑定一张 GPU)。CUDA-only 多GPU路径。"""
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+
+    def log(msg):
+        with open(log_path, "a") as f:
+            f.write("[w%d gpu%d] %s\n" % (wid, gpu, msg)); f.flush()
+
+    t0 = time.time()
+    m = _load_model(backbone, weights, "cuda")
+    log("model resident (%.0fs)" % (time.time() - t0))
+    acc_cls, acc_dist, acc_bnd, cnt, done = _accumulate_band(
+        m, "cuda", row0, row1, H, W, mosaic, ds, log=log)
     shm = "/dev/shm/parcelpipe_w%d.npz" % wid
     if not os.path.isdir("/dev/shm"):
         shm = "/tmp/parcelpipe_w%d.npz" % wid
@@ -136,24 +221,62 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
     log("DONE %d windows -> %s (%.0fmin)" % (done, shm, (time.time() - t0) / 60))
 
 
-def infer_global(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipeline_infer.log"):
-    """全局 /N 累加器推理 -> 返回 (cls(9,H4,W4), dist(H4,W4), bnd(H4,W4), tr4, crs, cov)。
-
-    多 GPU 行带并行(spawn), 每带一个 worker -> 主进程归并 sum/cnt。
-    单 GPU 列表(如 ['0'])也支持 -> 单带串行。
-    """
-    if SIDECAR not in sys.path:
-        sys.path.insert(0, SIDECAR)
+def _read_grid_meta(mosaic, ds):
+    """读 mosaic 几何 -> (H, W, H4, W4, tr4, crs)。"""
     import rasterio
     from affine import Affine
-    import torch.multiprocessing as mp
-
     src = rasterio.open(mosaic)
     H, W = src.height, src.width
     base_tr = src.transform; crs = src.crs
     src.close()
     H4 = math.ceil(H / ds); W4 = math.ceil(W / ds)
     tr4 = base_tr * Affine.scale(ds, ds)
+    return H, W, H4, W4, tr4, crs
+
+
+def _finalize_acc(acc_cls, acc_dist, acc_bnd, cnt, ds, t0):
+    cnt = np.maximum(cnt, 1e-6)
+    cls = acc_cls / cnt; dist = acc_dist / cnt; bnd = acc_bnd / cnt
+    cov = float((cnt > 1e-3).mean())
+    print("[infer] merged. /%d cov=%.4f cls%s (%.0fmin)" %
+          (ds, cov, cls.shape, (time.time() - t0) / 60), flush=True)
+    return cls, dist, bnd, cov
+
+
+def infer_single_device(mosaic, weights, backbone, ds, device, log_path="/tmp/parcel_pipeline_infer.log"):
+    """单设备(mps/cpu, 或单 GPU)整图滑窗推理 -> (cls, dist, bnd, tr4, crs, cov)。
+    单进程, 不 mp.spawn; 整图一条带(row0=0,row1=H)滑窗。"""
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    H, W, H4, W4, tr4, crs = _read_grid_meta(mosaic, ds)
+    print("[infer] mosaic %dx%d -> /%d grid %dx%d | device=%s | tr4=%s" %
+          (H, W, ds, H4, W4, device, tr4), flush=True)
+    open(log_path, "w").write("[infer] single-device %s %dx%d /%d %dx%d\n" % (device, H, W, ds, H4, W4))
+    t0 = time.time()
+    m = _load_model(backbone, weights, device)
+    print("[infer] model resident on %s (%.0fs)" % (device, time.time() - t0), flush=True)
+
+    def log(msg):
+        print("[infer] " + msg, flush=True)
+
+    acc_cls, acc_dist, acc_bnd, cnt, _ = _accumulate_band(
+        m, device, 0, H, H, W, mosaic, ds, log=log)
+    cls, dist, bnd, cov = _finalize_acc(acc_cls, acc_dist, acc_bnd, cnt, ds, t0)
+    return cls, dist, bnd, tr4, crs, cov
+
+
+def infer_global(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipeline_infer.log"):
+    """全局 /N 累加器推理(CUDA 多 GPU)-> (cls(9,H4,W4), dist, bnd, tr4, crs, cov)。
+
+    多 GPU 行带并行(spawn), 每带一个 worker -> 主进程归并 sum/cnt。
+    单 GPU 列表(如 ['0'])也支持 -> 单带串行。
+    非 CUDA 设备请走 infer_single_device。
+    """
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    import torch.multiprocessing as mp
+
+    H, W, H4, W4, tr4, crs = _read_grid_meta(mosaic, ds)
     print("[infer] mosaic %dx%d -> /%d grid %dx%d | tr4=%s" % (H, W, ds, H4, W4, tr4), flush=True)
 
     ng = len(gpus)
@@ -190,10 +313,7 @@ def infer_global(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipe
         z = np.load(ret[wid])
         acc_cls += z["acc_cls"]; acc_dist += z["acc_dist"]; acc_bnd += z["acc_bnd"]; cnt += z["cnt"]
         del z; os.remove(ret[wid])
-    cnt = np.maximum(cnt, 1e-6)
-    cls = acc_cls / cnt; dist = acc_dist / cnt; bnd = acc_bnd / cnt
-    cov = float((cnt > 1e-3).mean())
-    print("[infer] merged. /%d cov=%.4f cls%s (%.0fmin)" % (ds, cov, cls.shape, (time.time() - t0) / 60), flush=True)
+    cls, dist, bnd, cov = _finalize_acc(acc_cls, acc_dist, acc_bnd, cnt, ds, t0)
     return cls, dist, bnd, tr4, crs, cov
 
 
@@ -268,14 +388,60 @@ def vectorize_idmap(idmap, cls_of, tr4, crs):
     return gdf
 
 
+def resolve_overlaps(gdf, work_crs="EPSG:3857", min_area=1e-4):
+    """治 Chaikin 残留重叠 -> exact 零重叠(只动重叠对, 县级可扩展)。
+
+    Chaikin 在被 topojson 留成两条单引用 arc 的极少数内部边上, 两份独立移动 -> 局部重叠(本测试 ~1%)。
+    coverage_simplify(tol=0) snap 治不了真重叠。这里 STRtree 找重叠对, 重叠区从**较小**地块挖掉(归较大者),
+    union 不变 -> 无新缝。只触碰重叠对(非全量), O(#overlaps), 县级可扩展。
+    """
+    import geopandas as gpd
+    import shapely
+    from shapely import make_valid
+
+    geoms = list(gdf.geometry.values)
+    arr = np.array(geoms, dtype=object)
+    areas = shapely.area(arr)
+    tree = shapely.STRtree(arr)
+    pairs = tree.query(arr, predicate="overlaps")
+    seen = set(); n_fixed = 0
+    for a_i, b_i in zip(pairs[0], pairs[1]):
+        i, j = int(a_i), int(b_i)
+        if i >= j or (i, j) in seen:
+            continue
+        seen.add((i, j))
+        try:
+            inter = geoms[i].intersection(geoms[j])
+        except Exception:
+            continue
+        if inter.is_empty or inter.area <= min_area:
+            continue
+        loser = i if areas[i] < areas[j] else j   # 较小者让出重叠区
+        gm = geoms[loser].difference(inter)
+        if not gm.is_valid:
+            gm = make_valid(gm)
+        geoms[loser] = gm; n_fixed += 1
+    out = gpd.GeoDataFrame({"class_id": gdf["class_id"].values},
+                           geometry=gpd.GeoSeries(geoms, crs=gdf.crs))
+    out = out[~out.geometry.is_empty & out.geometry.notna()]
+    out = out.explode(index_parts=False).reset_index(drop=True)
+    out = out[out.geometry.geom_type == "Polygon"].reset_index(drop=True)
+    return out, n_fixed
+
+
 def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
     """全县整体拓扑保持平滑(region-agnostic, 从 yz_smooth2 抽出)。
 
     gdf(class_id+geometry) ->(work_crs)
       coverage_simplify(tol) 全县整体 去 /N 阶梯, 共享边精确一致, 顶点降 ~2x
       -> topojson.Topology(prequantize=False, shared_coords=False) 全县一次(共享边一份 arc)
-      -> 每 arc Chaikin(端点固定) -> to_gdf 重建 -> 共享边逐点一致 -> 零重叠无缝。
+      -> 每 arc Chaikin(端点固定) -> to_gdf 重建 -> 共享边逐点一致
+      -> resolve_overlaps 挖掉 Chaikin 残留重叠 -> exact 零重叠无缝。
     返回平滑后 GeoDataFrame(work_crs, 带 class_id)。
+
+    为何末步要 resolve_overlaps: topojson.to_gdf 偶尔把极少数内部边(尤其 island/hole 边界)留成
+    两条单引用 arc 而非一条共享 arc, Chaikin 后两份独立移动 -> 局部 ~1% 重叠。tol=0 coverage snap
+    治不了真重叠(实测无效); STRtree 逐重叠对挖掉(归较大块, union 不变)-> exact 零重叠, 县级可扩展。
     """
     import geopandas as gpd
     from shapely import make_valid, coverage_simplify
@@ -302,7 +468,17 @@ def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
     out = topo.to_gdf(crs=work_crs)
     out["geometry"] = out.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
     out = out[~out.geometry.is_empty & out.geometry.notna()].reset_index(drop=True)
-    print("[smooth] Chaikin(iters=%d) + rebuild done (%.0fs) | %d polys" %
+    # carry class_id through (topojson keeps feature attrs; guard if column name differs)
+    if "class_id" not in out.columns and "class_id" in g2.columns and len(out) == len(g2):
+        out["class_id"] = g2["class_id"].values
+
+    # 末步: 挖掉 Chaikin 残留重叠 -> exact 无缝。
+    if iters > 0:
+        t2 = time.time()
+        out, n_fixed = resolve_overlaps(out, work_crs=work_crs)
+        print("[smooth] resolve_overlaps: %d overlapping pairs fixed (%.0fs)" %
+              (n_fixed, time.time() - t2), flush=True)
+    print("[smooth] Chaikin(iters=%d) + rebuild + resolve done (%.0fs) | %d polys" %
           (iters, time.time() - t1, len(out)), flush=True)
     return out
 
@@ -374,15 +550,42 @@ def load_boundary(boundary_arg, utm="EPSG:32648"):
     return make_valid(unary_union(gb.geometry.values))
 
 
-def run_pipeline(mosaic, weights, backbone, out, boundary=None, downscale=4, smooth_iters=2,
-                 classes=None, gpus=("0", "1", "2", "3"), utm="EPSG:32648",
+def run_pipeline(mosaic=None, weights=None, backbone=None, out=None, boundary=None, downscale=4,
+                 smooth_iters=2, classes=None, gpus=("0", "1", "2", "3"), utm="EPSG:32648",
                  min_dist=20, peak_thr=0.4, min_area_px=200, ridge=True, tol=5.0,
-                 save_intermediate=None):
-    """完整通用管线: mosaic -> 无缝标准矢量 GeoParquet。返回 (out_gdf, report)。"""
+                 save_intermediate=None, device="auto", cells_dir=None):
+    """完整通用管线: (mosaic | cells_dir) -> 无缝标准矢量 GeoParquet。返回 (out_gdf, report)。
+
+    device: auto|cuda|mps|cpu。cuda -> 多 GPU 行带并行; mps/cpu -> 单设备整图滑窗。
+    cells_dir 给了 -> 先 rasterio.merge 自带拼接成临时 mosaic 再跑。
+    """
     classes = classes or default_classes()
+    dev = resolve_device(device)
     t0 = time.time()
-    # 1) 全局推理 + idmap
-    cls, dist, bnd, tr4, crs, cov = infer_global(mosaic, weights, backbone, downscale, list(gpus))
+    # 0) 自带拼接(cells_dir)或用预拼 mosaic
+    tmp_mosaic = None
+    if cells_dir:
+        tmp_mosaic = tempfile.NamedTemporaryFile(suffix="_mosaic.tif", delete=False).name
+        mosaic = mosaic_from_cells(cells_dir, tmp_mosaic)
+    if not mosaic:
+        raise ValueError("run_pipeline 需要 --mosaic 或 --cells-dir 之一")
+    try:
+        return _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth_iters,
+                                classes, gpus, utm, min_dist, peak_thr, min_area_px, ridge, tol,
+                                save_intermediate, dev, t0)
+    finally:
+        if tmp_mosaic and os.path.exists(tmp_mosaic):
+            os.remove(tmp_mosaic)
+
+
+def _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth_iters,
+                     classes, gpus, utm, min_dist, peak_thr, min_area_px, ridge, tol,
+                     save_intermediate, dev, t0):
+    # 1) 全局推理 + idmap(cuda 多 GPU; 非 cuda 单设备)
+    if str(dev).startswith("cuda") and len(list(gpus)) > 1:
+        cls, dist, bnd, tr4, crs, cov = infer_global(mosaic, weights, backbone, downscale, list(gpus))
+    else:
+        cls, dist, bnd, tr4, crs, cov = infer_single_device(mosaic, weights, backbone, downscale, dev)
     idmap, cls_of = idmap_from_heads(cls, dist, bnd, min_dist, peak_thr, min_area_px, ridge)
     del cls, dist, bnd
     if save_intermediate:
@@ -416,11 +619,13 @@ def run_pipeline(mosaic, weights, backbone, out, boundary=None, downscale=4, smo
 
 def main():
     ap = argparse.ArgumentParser(description="region-agnostic 1m parcel vector pipeline")
-    ap.add_argument("--mosaic", required=True, help="1m RGB mosaic GeoTIFF")
+    ap.add_argument("--mosaic", default="", help="预拼 1m RGB mosaic GeoTIFF(与 --cells-dir 二选一)")
+    ap.add_argument("--cells-dir", default="", help="per-cell EPSG:3857 tif 目录(自带 rasterio.merge 拼接)")
     ap.add_argument("--weights", required=True, help="四头 BDDF 权重 .pt")
     ap.add_argument("--backbone", required=True, help="DINOv3-Sat backbone dir")
     ap.add_argument("--out", required=True, help="output GeoParquet")
     ap.add_argument("--boundary", default="none", help="县界 parquet/geojson 或 none")
+    ap.add_argument("--device", default="auto", help="auto|cuda|mps|cpu (auto: cuda>mps>cpu)")
     ap.add_argument("--downscale", type=int, default=4, help="全局累加器 /N 网格(大 mosaic 一遍过)")
     ap.add_argument("--smooth-iters", type=int, default=2, help="Chaikin 迭代次数(0=off)")
     ap.add_argument("--tol", type=float, default=5.0, help="coverage_simplify 容差(米, 3857)")
@@ -433,12 +638,15 @@ def main():
     ap.add_argument("--no-ridge", action="store_true")
     ap.add_argument("--save-intermediate", default="", help="保存 idmap.npy 的目录(可选)")
     a = ap.parse_args()
+    if not a.mosaic and not a.cells_dir:
+        ap.error("必须给 --mosaic 或 --cells-dir 之一")
     classes = json.loads(Path(a.classes).read_text()) if a.classes else None
     si = a.save_intermediate or None
     if si:
         os.makedirs(si, exist_ok=True)
-    run_pipeline(a.mosaic, a.weights, a.backbone, a.out, boundary=a.boundary,
-                 downscale=a.downscale, smooth_iters=a.smooth_iters, classes=classes,
+    run_pipeline(mosaic=a.mosaic or None, cells_dir=a.cells_dir or None,
+                 weights=a.weights, backbone=a.backbone, out=a.out, boundary=a.boundary,
+                 device=a.device, downscale=a.downscale, smooth_iters=a.smooth_iters, classes=classes,
                  gpus=a.gpus.split(","), utm=a.utm, min_dist=a.min_dist, peak_thr=a.peak_thr,
                  min_area_px=a.min_area_px, ridge=not a.no_ridge, tol=a.tol, save_intermediate=si)
 
