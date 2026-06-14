@@ -206,7 +206,7 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
 
     def log(msg):
         with open(log_path, "a") as f:
-            f.write("[w%d gpu%d] %s\n" % (wid, gpu, msg)); f.flush()
+            f.write("[w%d gpu%s] %s\n" % (wid, gpu, msg)); f.flush()
 
     t0 = time.time()
     m = _load_model(backbone, weights, "cuda")
