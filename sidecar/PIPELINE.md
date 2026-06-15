@@ -120,6 +120,18 @@ clean, rep = postproc.run_postproc(my_gdf, classes, boundary=bnd_geom, utm="EPSG
   → 局部重叠/缝。全县一次 topojson 后**共享边只一份 arc**, 平滑端点固定 → 两侧逐点一致 → 严格无缝。
   `shared_coords=False`(junction/coord-hash)比 `shared_coords=True` 在 coverage_simplify 输出上合并共享边更可靠
   (零 Chaikin 重叠, 更少 arc), 故通用版用之, 平滑后无需额外 snap。
+- **巨型图斑边界跳过 Chaikin(治"悬空线段"伪影)**: 连通的**建筑/道路网**被连通域标号成一个巨型多边形(榆中 510万顶点/上千洞)。
+  Chaikin 对这种超复杂路网边界逐弧平滑 → **节点处狂产细楔形 sliver(w<1m)= 悬空线段**。修法 `smooth_coverage._giant_adjacent_arcs`:
+  至少一侧邻接巨型图斑(顶点≥5万)的 arc **跳过 Chaikin、保 coverage_simplify 直边**(道路本就直边), 田块间 arc 照常 Chaikin
+  保曲线 → 路网边界不再生楔形(榆中建筑 maxV 510万→69万, 楔形 sliver→0)。per-arc 选择性平滑, 默认开。
+- **"伪影 vs 真地物"诊断纪律(别盲目删 sliver)**: 细 sliver 两类 —— ① **Chaikin 节点楔形 = 真伪影**(上条已治);
+  ② **真实细线状地物**(窄梯田条/小道/田埂)= 1m 忠实捕捉、**该保留**。榆中残留 w<0.5 sliver 65%是耕地(真窄梯田)、仅6%建筑(路),
+  叠影像验证落在真梯田结构上。**只能"同类合并"且仅 -8%**(底层就是细的、多无同类邻居)→ **跨类并=毁真地物, 禁止**。
+  结论: 真伪影清掉后剩的细线是真地物不是错误; 嫌出图碎用**显示层 MMU(按面积隐藏极小)**, 不改数据。
+- **postproc 治伪影**: `drop_tiny_holes`(删近零面积退化 interior ring=节点微洞, 留嵌套/大洞)+ `run_postproc(skip_gaps=)`
+  (无缝 coverage 输入跳过 fill_gaps 全量 union, 防误填路网合法内部洞致面积虚高 +90km²)+ STRtree 逐对消重叠(避全量 unary_union)。
+- **榆中终版 = `yuzhong_FINAL.parquet`**(= SMOOTH3_v2, giant-skip 后): 74177 地块, 楔形伪影清零, 面积 3166.2(-0.006%), valid, 零重叠,
+  田块曲线保留; 旧 `yuzhong_SMOOTH3_chaikin3`(含 510万顶点建筑怪物)已被取代。
 - **DLTB(三调)= 权威真值**, 面积重建对比(`area_recon`, 榆中口径)校核, 总面积域内 ±0.3%。
 - **评估口径**(见 `cropland-seg-honest-eval`): 1m 地块级、跨县 + 跨省两口径; 跨省必报 argmax(部署点)和 best-thr(上界)。
 
