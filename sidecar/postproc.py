@@ -472,10 +472,16 @@ def _hex(rgb):
 # 标准收尾流程
 # ---------------------------------------------------------------------------
 def run_postproc(gdf, classes, boundary=None, utm="EPSG:32648", out_crs="EPSG:4326",
-                 sliver_kw=None, gap_kw=None, hole_kw=None, verbose=True):
+                 sliver_kw=None, gap_kw=None, hole_kw=None, skip_gaps=False, verbose=True):
     """**所有模型矢量成品的标准收尾流程**(region-agnostic), 串起标准末步:
 
         fix_invalid -> eliminate_slivers -> fill_gaps_holes -> drop_tiny_holes -> fix_invalid -> standardize
+
+    ⚠️ skip_gaps=True: **跳过 fill_gaps_holes**。当输入已是**拓扑无缝 coverage**(如 topojson 重建的
+    全县 coverage, 零真空隙)且含**大量合法内部洞**(被路网圈住的田 = 巨型背景图斑的上千 interior ring)时,
+    fill_gaps_holes 会把这些"洞"误当空白填进邻块, 造成**面积重复计**(实测榆中草地巨型连通域 +90km² 虚高,
+    所有 1494 个"gap"其实是已被其它 parcel 覆盖的内部洞)。这种输入应 skip_gaps=True(coverage 本就无缝,
+    无需填; drop_tiny_holes 仍清退化微洞)。仅当输入可能有**真空隙**(per-cell 拼接留白缝等)时才开 fill。
 
     设计意图: 任何 backend(cropland 二分类 / parcel watershed / SAM3 / landcover)出的
     原始矢量 idmap, 跑完这一套都得到同口径的无缝标准成品(零重叠/无空白/拓扑有效/字段统一)。
@@ -515,8 +521,14 @@ def run_postproc(gdf, classes, boundary=None, utm="EPSG:32648", out_crs="EPSG:43
     bnd_utm = None
     if boundary is not None:
         bnd_utm = make_valid(boundary)
-    gu, r_gap = fill_gaps_holes(gu, boundary=bnd_utm, verbose=verbose, **gap_kw)
-    report["fill_gaps_holes"] = r_gap
+    if skip_gaps:
+        report["fill_gaps_holes"] = {"skipped": True,
+                                     "reason": "seamless coverage input (topojson) — interior holes are legit nested parcels, not gaps"}
+        if verbose:
+            print("  [gap-hole] SKIPPED (skip_gaps=True): 输入为无缝 coverage, 内部洞=合法嵌套田块, 不填", flush=True)
+    else:
+        gu, r_gap = fill_gaps_holes(gu, boundary=bnd_utm, verbose=verbose, **gap_kw)
+        report["fill_gaps_holes"] = r_gap
 
     gu, r_hole = drop_tiny_holes(gu, verbose=verbose, **hole_kw)
     report["drop_tiny_holes"] = r_hole
