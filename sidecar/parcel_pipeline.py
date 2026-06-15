@@ -431,15 +431,60 @@ def resolve_overlaps(gdf, work_crs="EPSG:3857", min_area=1e-4):
     return out, n_fixed
 
 
-def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
-    """全县整体拓扑保持平滑(region-agnostic, 从 yz_smooth2 抽出)。
+def _iter_arc_ids(arcs):
+    """递归遍历 topojson geometry 的嵌套 arcs 结构(Polygon: [[ring...]], MultiPolygon: [[[ring...]]]),
+    yield 每个 arc 的**绝对索引**。topojson 用 ~a (即 -a-1) 表示 arc a 反向引用 -> 取 a if a>=0 else ~a。"""
+    for item in arcs:
+        if isinstance(item, list):
+            yield from _iter_arc_ids(item)
+        else:
+            yield item if item >= 0 else ~item
+
+
+def _giant_adjacent_arcs(topo, g2, giant_vertex_thr):
+    """标出"至少一侧邻接巨型图斑"的 arc(这些 arc = 建筑/道路网那种巨复杂边界, 平滑它只产楔形 sliver)。
+
+    巨型图斑判据 = 该图斑(coverage_simplify 后)顶点数 >= giant_vertex_thr。这一条就能抓全:
+    建筑路网连通域(榆中 5.1M 顶点 / 数千洞), 也包括草地/林地连成的巨型背景连通域(>50k 顶点)。
+    它们的边界本就该是直边(道路/田埂/地块边), Chaikin 平滑无物理意义且在节点狂产细 sliver。
+
+    返回: bool 数组(len = n_arcs), True = 该 arc 至少一侧是巨型图斑 -> 跳过 Chaikin。
+    topojson 保 object 顺序 = g2 行顺序, 故第 i 个 topo geometry 对应 g2.iloc[i]。
+    """
+    import shapely
+    o = topo.output
+    n_arcs = len(o["arcs"])
+    geom_objs = o["objects"][list(o["objects"].keys())[0]]["geometries"]
+    nverts = shapely.get_num_coordinates(g2.geometry.values)
+    giant_adj = np.zeros(n_arcs, dtype=bool)
+    n_giant = 0
+    for i, gm in enumerate(geom_objs):
+        if i >= len(nverts) or nverts[i] < giant_vertex_thr:
+            continue
+        n_giant += 1
+        for aid in _iter_arc_ids(gm.get("arcs", [])):
+            if 0 <= aid < n_arcs:
+                giant_adj[aid] = True
+    return giant_adj, n_giant
+
+
+def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857", giant_vertex_thr=50000):
+    """全县整体拓扑保持平滑(region-agnostic, 从 yz_smooth2 抽出)+ **per-arc 选择性平滑**。
 
     gdf(class_id+geometry) ->(work_crs)
       coverage_simplify(tol) 全县整体 去 /N 阶梯, 共享边精确一致, 顶点降 ~2x
       -> topojson.Topology(prequantize=False, shared_coords=False) 全县一次(共享边一份 arc)
-      -> 每 arc Chaikin(端点固定) -> to_gdf 重建 -> 共享边逐点一致
+      -> **per-arc 选择性 Chaikin**(见下) -> to_gdf 重建 -> 共享边逐点一致
       -> resolve_overlaps 挖掉 Chaikin 残留重叠 -> exact 零重叠无缝。
     返回平滑后 GeoDataFrame(work_crs, 带 class_id)。
+
+    **per-arc 选择性 Chaikin(治"悬空线段"根因)**:
+      榆中终版的 sliver 根源 = 建筑类(道路网)被连通域标号成一个巨型多边形(榆中 5.1M 顶点 / 上千洞 =
+      被路网圈住的田)。Chaikin 对这种超复杂路网边界逐弧平滑 -> 节点处狂产细 sliver(w<1m), 合并又在
+      其边再生 -> 清不动。神池路网稀(洞少)能清, 榆中密(洞多)清不动。
+      修法: 标出顶点数 >= giant_vertex_thr 的**巨型图斑**(建筑路网/巨型背景连通域); 对**至少一侧邻接
+      巨型图斑的 arc 跳过 Chaikin**(道路/建筑本就该直边, 平滑它无意义且生楔形), 只保留 coverage_simplify
+      的直边; 两侧都是普通田块的 arc 照常 Chaikin 保曲线。-> 真田块仍平滑, 路网/建筑边界直边, 不再产 sliver。
 
     为何末步要 resolve_overlaps: topojson.to_gdf 偶尔把极少数内部边(尤其 island/hole 边界)留成
     两条单引用 arc 而非一条共享 arc, Chaikin 后两份独立移动 -> 局部 ~1% 重叠。tol=0 coverage snap
@@ -466,7 +511,16 @@ def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
     print("[smooth] topojson built: %d arcs (%.0fs)" % (n_arcs, time.time() - t1), flush=True)
 
     if iters > 0:
-        topo.output["arcs"] = [chaikin_arc(arc, iters) for arc in topo.output["arcs"]]
+        # per-arc 选择性平滑: 邻接巨型图斑(路网/建筑/巨型背景连通域)的 arc 跳过 Chaikin -> 不产楔形 sliver。
+        giant_adj, n_giant = _giant_adjacent_arcs(topo, g2, giant_vertex_thr)
+        n_skip = int(giant_adj.sum())
+        print("[smooth] per-arc selective Chaikin: %d giant parcels (verts>=%d), "
+              "skip Chaikin on %d/%d giant-adjacent arcs (keep straight), smooth %d田块 arcs" %
+              (n_giant, giant_vertex_thr, n_skip, n_arcs, n_arcs - n_skip), flush=True)
+        topo.output["arcs"] = [
+            (arc if giant_adj[ai] else chaikin_arc(arc, iters))
+            for ai, arc in enumerate(topo.output["arcs"])
+        ]
     out = topo.to_gdf(crs=work_crs)
     out["geometry"] = out.geometry.apply(lambda x: x if x.is_valid else make_valid(x))
     out = out[~out.geometry.is_empty & out.geometry.notna()].reset_index(drop=True)
@@ -480,7 +534,7 @@ def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857"):
         out, n_fixed = resolve_overlaps(out, work_crs=work_crs)
         print("[smooth] resolve_overlaps: %d overlapping pairs fixed (%.0fs)" %
               (n_fixed, time.time() - t2), flush=True)
-    print("[smooth] Chaikin(iters=%d) + rebuild + resolve done (%.0fs) | %d polys" %
+    print("[smooth] Chaikin(iters=%d, selective) + rebuild + resolve done (%.0fs) | %d polys" %
           (iters, time.time() - t1, len(out)), flush=True)
     return out
 
