@@ -441,34 +441,67 @@ def _iter_arc_ids(arcs):
             yield item if item >= 0 else ~item
 
 
-def _giant_adjacent_arcs(topo, g2, giant_vertex_thr):
-    """标出"至少一侧邻接巨型图斑"的 arc(这些 arc = 建筑/道路网那种巨复杂边界, 平滑它只产楔形 sliver)。
+def _giant_adjacent_arcs(topo, g2, giant_vertex_thr, linear_shape_ratio_thr=100000.0):
+    """标出"至少一侧邻接**线状网络型**巨型图斑"的 arc(=建筑/道路网那种缠绕细线边界, 平滑只产楔形 sliver)。
 
-    巨型图斑判据 = 该图斑(coverage_simplify 后)顶点数 >= giant_vertex_thr。这一条就能抓全:
-    建筑路网连通域(榆中 5.1M 顶点 / 数千洞), 也包括草地/林地连成的巨型背景连通域(>50k 顶点)。
-    它们的边界本就该是直边(道路/田埂/地块边), Chaikin 平滑无物理意义且在节点狂产细 sliver。
+    ⚠️ 修正(误伤草地/林地教训): 旧判据=纯顶点数>=阈值, 把草地(maxV 53万)、林地(maxV 5.6万)连成的
+    **紧凑大团块**也判 giant -> 绝大多数"田块↔草地/林地"的边被跳过平滑、留成折角, 整体反而不如纯 Chaikin。
+    giant-skip 的本意只治**建筑路网**(线状网络: 道路把成百上千田圈成网, 直边对 + Chaikin 在节点产 sliver),
+    紧凑大团块(草地/林地)的边界该照常平滑保曲线。
 
-    返回: bool 数组(len = n_arcs), True = 该 arc 至少一侧是巨型图斑 -> 跳过 Chaikin。
+    新判据 = **giant(顶点>=阈值) 且 线状网络**, 二者都满足才跳 Chaikin。线状性用**类无关**的形状比:
+      shape_ratio = perimeter^2 / area  (无量纲, 线状细长缠绕 -> 巨大; 紧凑团块 -> 小, ~4π=12.6 起)。
+    榆中实测(coverage_simplify tol=5 后, 6 个 giant):
+      建筑路网  shape_r=403850 (洞2141)  <- 该跳
+      草地团块  shape_r=12284~58613 (洞266~3187) <- 不该跳, 照常 Chaikin
+      林地团块  shape_r=2892 (洞335)     <- 不该跳
+    形状比把建筑(403850)与最坏草地(58613)拉开 ~7x; 阈值 100000 留 ~1.7x 安全裕度(建筑)/~6.9x(草地)。
+    (洞数判不准: 草地 3187 洞 > 建筑 2141 洞, 草地也圈住很多田 -> 不能用洞数, 改用形状比。)
+    注: giant 顶点阈值仍是必要前提(单块普通建筑/水体不会有 5 万顶点; 只有路网连通域才 giant), 二者叠加最稳。
+
+    返回: (giant_adj bool[len=n_arcs], n_linear, diag列表)。giant_adj=该 arc 至少一侧是线状巨斑 -> 跳 Chaikin。
+    diag: 每个 giant 的 (class_id, verts, holes, shape_ratio, is_linear) 供台账打印。
     topojson 保 object 顺序 = g2 行顺序, 故第 i 个 topo geometry 对应 g2.iloc[i]。
     """
     import shapely
     o = topo.output
     n_arcs = len(o["arcs"])
     geom_objs = o["objects"][list(o["objects"].keys())[0]]["geometries"]
-    nverts = shapely.get_num_coordinates(g2.geometry.values)
+    geoms = g2.geometry.values
+    nverts = shapely.get_num_coordinates(geoms)
+    cid_col = g2["class_id"].values if "class_id" in g2.columns else None
     giant_adj = np.zeros(n_arcs, dtype=bool)
-    n_giant = 0
+    n_linear = 0
+    diag = []
     for i, gm in enumerate(geom_objs):
         if i >= len(nverts) or nverts[i] < giant_vertex_thr:
             continue
-        n_giant += 1
+        gobj = geoms[i]
+        area = shapely.area(gobj)
+        per = shapely.length(gobj)
+        shape_ratio = (per * per / area) if area > 0 else float("inf")
+        # 洞数(仅诊断, 不入判据)
+        gt = getattr(gobj, "geom_type", "")
+        if gt == "Polygon":
+            holes = len(gobj.interiors)
+        elif gt == "MultiPolygon":
+            holes = sum(len(p.interiors) for p in gobj.geoms)
+        else:
+            holes = 0
+        is_linear = shape_ratio >= linear_shape_ratio_thr
+        diag.append((int(cid_col[i]) if cid_col is not None else -1,
+                     int(nverts[i]), int(holes), float(shape_ratio), bool(is_linear)))
+        if not is_linear:
+            continue            # 紧凑大团块(草地/林地): 不跳, 照常 Chaikin 保曲线
+        n_linear += 1
         for aid in _iter_arc_ids(gm.get("arcs", [])):
             if 0 <= aid < n_arcs:
                 giant_adj[aid] = True
-    return giant_adj, n_giant
+    return giant_adj, n_linear, diag
 
 
-def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857", giant_vertex_thr=50000):
+def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857", giant_vertex_thr=50000,
+                    linear_shape_ratio_thr=100000.0):
     """全县整体拓扑保持平滑(region-agnostic, 从 yz_smooth2 抽出)+ **per-arc 选择性平滑**。
 
     gdf(class_id+geometry) ->(work_crs)
@@ -482,9 +515,12 @@ def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857", giant_vertex_th
       榆中终版的 sliver 根源 = 建筑类(道路网)被连通域标号成一个巨型多边形(榆中 5.1M 顶点 / 上千洞 =
       被路网圈住的田)。Chaikin 对这种超复杂路网边界逐弧平滑 -> 节点处狂产细 sliver(w<1m), 合并又在
       其边再生 -> 清不动。神池路网稀(洞少)能清, 榆中密(洞多)清不动。
-      修法: 标出顶点数 >= giant_vertex_thr 的**巨型图斑**(建筑路网/巨型背景连通域); 对**至少一侧邻接
-      巨型图斑的 arc 跳过 Chaikin**(道路/建筑本就该直边, 平滑它无意义且生楔形), 只保留 coverage_simplify
-      的直边; 两侧都是普通田块的 arc 照常 Chaikin 保曲线。-> 真田块仍平滑, 路网/建筑边界直边, 不再产 sliver。
+      修法: 标出顶点数 >= giant_vertex_thr **且线状网络**(shape_ratio=perimeter^2/area >= linear_shape_ratio_thr)
+      的**线状巨斑**(建筑路网); 对**至少一侧邻接它的 arc 跳过 Chaikin**(道路/建筑本就该直边, 平滑无意义且生楔形),
+      只保留 coverage_simplify 的直边; 其余 arc(含邻接草地/林地紧凑大团块的)照常 Chaikin 保曲线。
+      ⚠️ 旧版只看顶点数, 把草地(53万顶点)/林地紧凑大团块也判 giant -> 田块↔草地/林地的边被跳平滑留折角,
+      反而不如纯 Chaikin。新增形状比判据(类无关)只锁定真·线状路网, 紧凑团块边重新平滑。
+      -> 真田块/草地/林地边仍平滑, 仅路网/建筑边界直边, 不再产 sliver。
 
     为何末步要 resolve_overlaps: topojson.to_gdf 偶尔把极少数内部边(尤其 island/hole 边界)留成
     两条单引用 arc 而非一条共享 arc, Chaikin 后两份独立移动 -> 局部 ~1% 重叠。tol=0 coverage snap
@@ -511,12 +547,18 @@ def smooth_coverage(gdf, tol=5.0, iters=2, work_crs="EPSG:3857", giant_vertex_th
     print("[smooth] topojson built: %d arcs (%.0fs)" % (n_arcs, time.time() - t1), flush=True)
 
     if iters > 0:
-        # per-arc 选择性平滑: 邻接巨型图斑(路网/建筑/巨型背景连通域)的 arc 跳过 Chaikin -> 不产楔形 sliver。
-        giant_adj, n_giant = _giant_adjacent_arcs(topo, g2, giant_vertex_thr)
+        # per-arc 选择性平滑: 只对邻接**线状网络型**巨斑(建筑/道路网)的 arc 跳 Chaikin -> 不产楔形 sliver;
+        # 紧凑大团块(草地/林地)照常 Chaikin 保曲线(修旧版误伤教训, 见 _giant_adjacent_arcs)。
+        giant_adj, n_linear, diag = _giant_adjacent_arcs(
+            topo, g2, giant_vertex_thr, linear_shape_ratio_thr=linear_shape_ratio_thr)
         n_skip = int(giant_adj.sum())
-        print("[smooth] per-arc selective Chaikin: %d giant parcels (verts>=%d), "
-              "skip Chaikin on %d/%d giant-adjacent arcs (keep straight), smooth %d田块 arcs" %
-              (n_giant, giant_vertex_thr, n_skip, n_arcs, n_arcs - n_skip), flush=True)
+        print("[smooth] per-arc selective Chaikin: %d giant parcels (verts>=%d), of which %d 线状(shape_r>=%.0f)->跳; "
+              "skip Chaikin on %d/%d arcs (keep straight), smooth %d arcs" %
+              (len(diag), giant_vertex_thr, n_linear, linear_shape_ratio_thr,
+               n_skip, n_arcs, n_arcs - n_skip), flush=True)
+        for (cid_i, v_i, h_i, sr_i, lin_i) in sorted(diag, key=lambda x: -x[3]):
+            print("[smooth]   giant: class=%d verts=%d holes=%d shape_ratio=%.1f -> %s" %
+                  (cid_i, v_i, h_i, sr_i, "线状(跳Chaikin)" if lin_i else "紧凑(照常平滑)"), flush=True)
         topo.output["arcs"] = [
             (arc if giant_adj[ai] else chaikin_arc(arc, iters))
             for ai, arc in enumerate(topo.output["arcs"])
