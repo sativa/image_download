@@ -516,3 +516,17 @@ max 7.8万→~10², 规则度对 frame 精度不敏感=3ep head-only 已够, 联
 - 脚本 train_radio_1m.py / train_radio_7class.py(RadioFreqUNetBDDF)/ yz_global_radio.py; 权重 radio_1m_gdlxff/best.pt + radio_v4_bddf/best.pt(0.7166 vs DINOv3-Sat 0.7538)。坑: dist-transform GT 在192核炸线程(OMP/MKL_NUM_THREADS=2 修, GPU 0%→99%)、eval 慢(--eval-cells 40)、假 DONE 误触发 Phase2。
 
 **RSE manuscript 更新(`~/CODE_BLOCK_DNDC/cropland_1m_parcel/docs/rse_manuscript.md`):** §4.13 整段重写=无缝拓扑有效 coverage(取代旧 per-cell+FFL 产品, Table10 真实逐类 vs DLTB620123)+ §4.12 FFL 衔接(逐实例→县级拓扑保持)+ Abstract/§1.4贡献5/结论加无缝县级部署 + **表号统一 1-11**(原 Tibet跳7/文献6落尾)+ Fig.7 梯田骨干对比(零样本/训练后RADIO/本文 三列)/ Fig.8 榆中县级 + §4.6 配对 null 结果 + refs 17 AM-RADIO/18 SigLIP2 + Data&code availability 补实。commit dfbea8d/9054e28/696c2ba/1dd67a3/092f78d/858eaeb/bf6344e。fig9(榆中7类C-RADIO对比)交付未入正文(训练段数 caveat)。
+
+## 2026-06-15/16 — "悬空线段"伪影根治(建筑路网巨斑 giant-skip)+ 伪影vs真梯田诊断纪律 + CLI自动清理 + 神池对齐
+
+**用户报最终 geoparquet 满是"悬空细线段"。诊断=两类, 治法不同:**
+
+**① postproc 强化(治 Chaikin 节点微伪影, commit 0c5520d/2e77f7f):** 诊断 Chaikin 平滑在拓扑节点留两类微伪影 —— ~8845 个**细 sliver**(w=area/peri<0.5m, 渲染 boundary 时细长闭环=悬空线段)+ **108282 个近零面积退化 interior ring 微洞**(median 0m², 亚像素看不见但脏)。原 `eliminate_slivers` 只清 136。强化: `is_sliver` 改 **细(w<1.5m)且小(area<100m²)**(面积上限护真路/长梯田); `eliminate_slivers` 用 STRtree bbox 候选 + 向量化邻接(避巨斑 boundary∩boundary 慢)并入最长共享边邻块; 新 `drop_tiny_holes`(删 area<30m² 退化环, 留嵌套/大洞); `run_postproc(skip_gaps=)`(无缝输入跳 fill_gaps 全量union, 防误填路网合法内洞致面积虚高+90km²); `standardize` 末加 make_valid。**已进 `parcel_pipeline.run_pipeline`→run_postproc=CLI县级自动清理**。
+
+**② 上游根因=建筑路网巨型多边形(commit 26b30fc/731c34e):** 残留细 sliver 集中在**建筑(道路网)被连通域标号成的单个巨型多边形**(榆中 maxV **510万顶点**/上千洞=被路网圈的田)边界 —— Chaikin 逐弧平滑这种超复杂路网边界, 在无数交叉节点**狂产细楔形 sliver**, 合并又在其边再生(死循环), 清不动。修=`smooth_coverage._giant_adjacent_arcs`: 邻接**线状网络型巨斑**的 arc **跳过 Chaikin 保直边**(路本就直边), 其余照常平滑。**判据迭代(关键)**: 初版"仅顶点≥5万"**误伤草地(53万顶点)/林地团块** → 田块↔草地/林地边被跳平滑留折角, 用户报"反而不如SMOOTH3平滑"; **修正为 顶点≥5万 且 shape_ratio(周长²/面积)≥10万**(类无关线状判据: 榆中建筑 shape_ratio=403850线状 vs 草地12k~58k/林地2.9k紧凑, 拉开~7x)→ 只路网命中, 草地/林地团块边重新Chaikin成曲线, 跳过arc 51144→26981。**榆中建筑 maxV 510万→69万, 楔形 sliver→0, 草地/林地边平滑, 路网直边。**
+
+**③ "伪影 vs 真地物"诊断纪律(用户逼出的关键认知):** 残留 ~4500 细 sliver **不是伪影、是真地物, 不该删**。三步验证: (a) 类别分布 w<0.5 sliver = **耕地65%/草地16%/林地8%/建筑(路)仅6%**; (b) **叠1m影像**看耕地 sliver 落在真梯田等高线上(一串绿点沿梯田边); (c) **同类合并仅-8%**(底层就是细的、多无同类邻居), 跨类合并=毁真地物。**铁律: 真伪影(Chaikin楔形)清掉后剩的细线是 1m 忠实捕捉的真窄梯田条, 嫌出图碎用显示层 MMU(area<300m²隐藏=0.028%面积)不改数据。** 神池反证: 路网稀→giant-skip后 w<1 sliver 10007→**4(近零)**; 榆中真梯田多→残留6096=真地物。
+
+**④ 神池(140930)giant-skip 对齐(同口径):** 同命令重跑(唯一变量=代码, 推理产物57354polys/137763arcs逐项一致)。建筑 maxV **390万→473k(-88%)**、w<1 sliver **10007→4**、invalid 1→0、面积1483守恒、零重叠、逐类±0.2%对齐榆中。`shenchi_FINAL.parquet`(39215polys, 比旧小因巨斑顶点不再翻倍)。
+
+**产物/口径:** 榆中终版 `yuzhong_FINAL.parquet`(=v2b, 73325地块, 591MB, 草地/林地边曲线+路网直边+楔形0, 面积3166.2/-0.005%/valid/零重叠); 神池 `shenchi_FINAL.parquet`。giant-skip+postproc 进 main→**CLI 县级自动产出此水平**。**论文 §4.13 补句**(线状网络巨斑跳过平滑+残留=真梯田保留+MMU显示, commit 81dac44)。PIPELINE.md + 记忆(terrace-band)沉淀。**性能坑**: 建筑线状巨斑重Chaikin后420万顶点, topojson/resolve/clip/union 各阶段慢, 榆中v2b端到端161min(免推理)→ 日后值得对建筑巨斑矢量化后单独几何简化提速。新脚本 `diag_giants.py`/`yz_regen_v2b.py`/`clean_products.py`。**工程纪律**: 别用 until-loop 后台轮询(harness杀前台sleep, exit144)→ setsid+sleep读文件; agent 别派会空转的 Monitor 子任务(神池agent卡死循环); session限额掐断agent但服务器setsid进程独立续跑。
