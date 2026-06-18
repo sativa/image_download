@@ -216,9 +216,17 @@ def _band_worker(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_
     log("model resident (%.0fs)" % (time.time() - t0))
     acc_cls, acc_dist, acc_bnd, cnt, done = _accumulate_band(
         m, "cuda", row0, row1, H, W, mosaic, ds, log=log)
-    shm = "/dev/shm/parcelpipe_w%d.npz" % wid
-    if not os.path.isdir("/dev/shm"):
-        shm = "/tmp/parcelpipe_w%d.npz" % wid
+    # scratch: /dev/shm(RAM,快)放不下 npz 时落 /tmp(磁盘)——治大区域 /N 累加器写满 shm/爆内存。
+    # 每 npz ≈ (9·H4·W4 + 3·H4·W4)·4B(长治地级市 /4 ≈80GB/worker);县级小,照旧走 /dev/shm。
+    need = acc_cls.nbytes + acc_dist.nbytes + acc_bnd.nbytes + cnt.nbytes
+    scratch = "/dev/shm"
+    if not os.path.isdir(scratch):
+        scratch = "/tmp"
+    else:
+        st = os.statvfs(scratch)
+        if st.f_bavail * st.f_frsize < need * 1.1:
+            scratch = "/tmp"
+    shm = "%s/parcelpipe_w%d.npz" % (scratch, wid)
     np.savez(shm, acc_cls=acc_cls, acc_dist=acc_dist, acc_bnd=acc_bnd, cnt=cnt)
     ret_dict[wid] = shm
     log("DONE %d windows -> %s (%.0fmin)" % (done, shm, (time.time() - t0) / 60))
