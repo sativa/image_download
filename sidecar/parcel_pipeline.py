@@ -96,7 +96,8 @@ def mosaic_from_cells(cells_dir, out_tif):
     mos = mos[:nb]
     meta.update(driver="GTiff", height=mos.shape[1], width=mos.shape[2],
                 count=nb, transform=mos_tr, crs=crs, dtype=mos.dtype,
-                compress="deflate", tiled=True)
+                compress="deflate", tiled=True,
+                bigtiff="IF_SAFER")   # 文件可能 >4GB 时自动 BIGTIFF(地级市/省级 mosaic);县级照旧经典 TIFF
     with rasterio.open(out_tif, "w", **meta) as dst:
         dst.write(mos)
     print("[mosaic] wrote %s (%dx%d, %d bands, crs=%s)" %
