@@ -328,6 +328,152 @@ def infer_global(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipe
     return cls, dist, bnd, tr4, crs, cov
 
 
+# ===========================================================================
+# band-local + 磁盘 memmap 全局推理(与 infer_global 数值逐位一致, test_memmap_infer 验证 max|Δ|=0)。
+# 每 worker 只分配本带 /N 切片(内存 ~1/带数), 主进程用磁盘 memmap 装配(带间 Hann 重叠行 += 求和)。
+# -> 根治"每 worker 全图累加器"内存墙(大市/省级满卡不爆)。cuda 多卡默认走此路(_run_from_mosaic)。
+# ===========================================================================
+def _accumulate_band_local(m, device, row0, row1, H, W, mosaic, ds, log=print):
+    """同 _accumulate_band, 但只分配本带 /N 切片。返回 (cls_loc, dist_loc, bnd_loc, cnt_loc, r0_local, done)。"""
+    import rasterio
+    from rasterio.windows import Window
+    import cv2
+    import torch
+    import torch.nn.functional as F
+    from train_dino_1m_v3 import enhance6
+    from train_dino_1m import norm6
+    is_cuda = str(device).startswith("cuda")
+    cs4 = CS // ds
+    hann4 = make_hann(cs4)
+    H4 = math.ceil(H / ds); W4 = math.ceil(W / ds)
+    ys_all = list(range(0, max(1, H - CS + 1), STRIDE))
+    if ys_all[-1] != H - CS:
+        ys_all.append(max(0, H - CS))
+    xs_all = list(range(0, max(1, W - CS + 1), STRIDE))
+    if xs_all[-1] != W - CS:
+        xs_all.append(max(0, W - CS))
+    ys = [t for t in ys_all if row0 <= t < row1]
+    if not ys:
+        return (np.zeros((9, 0, W4), np.float32), np.zeros((0, W4), np.float32),
+                np.zeros((0, W4), np.float32), np.zeros((0, W4), np.float32), 0, 0)
+    r0_local = ys[0] // ds
+    r1_local = min(H4, ys[-1] // ds + cs4)
+    hL = r1_local - r0_local
+    acc_cls = np.zeros((9, hL, W4), np.float32)
+    acc_dist = np.zeros((hL, W4), np.float32)
+    acc_bnd = np.zeros((hL, W4), np.float32)
+    cnt = np.zeros((hL, W4), np.float32)
+    ndvi = np.zeros((5, CS, CS), np.float32)
+    src = rasterio.open(mosaic); done = 0
+    for t in ys:
+        rowblk = src.read([1, 2, 3], window=Window(0, t, W, CS))
+        for l in xs_all:
+            tile = rowblk[:, :, l:l + CS]
+            ch, cw = tile.shape[1], tile.shape[2]
+            if ch < CS or cw < CS:
+                pad = np.zeros((3, CS, CS), np.uint8); pad[:, :ch, :cw] = tile; tile = pad
+            rgb = np.ascontiguousarray(tile).astype(np.uint8)
+            x6 = np.concatenate([rgb, rgb], 0)
+            xc = np.concatenate([norm6(enhance6(x6)), ndvi], 0)
+            xb = torch.from_numpy(xc).unsqueeze(0).to(device)
+            with torch.no_grad():
+                if is_cuda:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        o = m(xb)
+                else:
+                    o = m(xb)
+                cl, bn, dsh = o[0], o[1], o[2]
+                if cl.shape[-2:] != (CS, CS):
+                    cl = F.interpolate(cl, (CS, CS), mode="bilinear", align_corners=False)
+                    bn = F.interpolate(bn, (CS, CS), mode="bilinear", align_corners=False)
+                    dsh = F.interpolate(dsh, (CS, CS), mode="bilinear", align_corners=False)
+                pr = torch.softmax(cl.float(), 1)[0].cpu().numpy()
+                pd = torch.sigmoid(dsh.float())[0, 0].cpu().numpy()
+                pb = torch.sigmoid(bn.float())[0, 0].cpu().numpy()
+            pr4 = np.stack([cv2.resize(pr[c], (cs4, cs4), interpolation=cv2.INTER_AREA) for c in range(9)], 0)
+            pd4 = cv2.resize(pd, (cs4, cs4), interpolation=cv2.INTER_AREA)
+            pb4 = cv2.resize(pb, (cs4, cs4), interpolation=cv2.INTER_AREA)
+            t4 = t // ds; l4 = l // ds
+            h4 = min(cs4, H4 - t4); w4 = min(cs4, W4 - l4)
+            if h4 <= 0 or w4 <= 0:
+                continue
+            wn = hann4[:h4, :w4]
+            rs = t4 - r0_local
+            acc_cls[:, rs:rs + h4, l4:l4 + w4] += pr4[:, :h4, :w4] * wn
+            acc_dist[rs:rs + h4, l4:l4 + w4] += pd4[:h4, :w4] * wn
+            acc_bnd[rs:rs + h4, l4:l4 + w4] += pb4[:h4, :w4] * wn
+            cnt[rs:rs + h4, l4:l4 + w4] += wn
+            done += 1
+    src.close()
+    return acc_cls, acc_dist, acc_bnd, cnt, r0_local, done
+
+
+def _band_worker_local(wid, gpu, row0, row1, H, W, mosaic, weights, backbone, ds, ret_dict, scratch):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    m = _load_model(backbone, weights, "cuda")
+    cls, dist, bnd, cnt, r0, done = _accumulate_band_local(m, "cuda", row0, row1, H, W, mosaic, ds)
+    f = "%s/parcelpipe_local_w%d.npz" % (scratch, wid)
+    np.savez(f, cls=cls, dist=dist, bnd=bnd, cnt=cnt, r0=r0)
+    ret_dict[wid] = f
+
+
+def infer_global_memmap(mosaic, weights, backbone, ds, gpus, log_path="/tmp/parcel_pipeline_infer.log"):
+    """band-local + 磁盘 memmap 版 infer_global(数值逐位一致 / 内存 ~1/带数 / 主进程装配不持全图)。
+    返回 (cls(9,H4,W4), dist, bnd, tr4, crs, cov)。slices/memmap 走磁盘 /tmp scratch(非 /dev/shm RAM)。"""
+    import torch.multiprocessing as mp
+    import tempfile, shutil
+    if SIDECAR not in sys.path:
+        sys.path.insert(0, SIDECAR)
+    H, W, H4, W4, tr4, crs = _read_grid_meta(mosaic, ds)
+    print("[infer] (memmap) mosaic %dx%d -> /%d grid %dx%d" % (H, W, ds, H4, W4), flush=True)
+    ng = len(gpus)
+    ys_all = list(range(0, max(1, H - CS + 1), STRIDE))
+    if ys_all[-1] != H - CS:
+        ys_all.append(max(0, H - CS))
+    per = math.ceil(len(ys_all) / ng)
+    bands = []
+    for i in range(ng):
+        yi = ys_all[i * per:(i + 1) * per]
+        if yi:
+            bands.append((yi[0], yi[-1] + 1))
+    print("[infer] (memmap) %d row-windows -> %d bands: %s" % (len(ys_all), len(bands), bands), flush=True)
+    scratch = tempfile.mkdtemp(prefix="parcelpipe_mm_", dir="/tmp")
+    ctx = mp.get_context("spawn"); mgr = ctx.Manager(); ret = mgr.dict()
+    procs = []; t0 = time.time()
+    for wid, (r0, r1) in enumerate(bands):
+        p = ctx.Process(target=_band_worker_local,
+                        args=(wid, gpus[wid % ng], r0, r1, H, W, mosaic, weights, backbone, ds, ret, scratch))
+        p.start(); procs.append(p)
+    for p in procs:
+        p.join()
+    if len(ret) != len(bands):
+        shutil.rmtree(scratch, ignore_errors=True)
+        raise RuntimeError("infer(memmap) FAIL: %d/%d bands (exit=%s)" % (len(ret), len(bands), [p.exitcode for p in procs]))
+    try:
+        mm_cls = np.memmap(scratch + "/cls.dat", dtype=np.float32, mode="w+", shape=(9, H4, W4))
+        mm_dist = np.memmap(scratch + "/dist.dat", dtype=np.float32, mode="w+", shape=(H4, W4))
+        mm_bnd = np.memmap(scratch + "/bnd.dat", dtype=np.float32, mode="w+", shape=(H4, W4))
+        mm_cnt = np.memmap(scratch + "/cnt.dat", dtype=np.float32, mode="w+", shape=(H4, W4))
+        for wid in range(len(bands)):
+            z = np.load(ret[wid]); r0 = int(z["r0"]); hL = z["cls"].shape[1]
+            if hL:
+                mm_cls[:, r0:r0 + hL, :] += z["cls"]; mm_dist[r0:r0 + hL, :] += z["dist"]
+                mm_bnd[r0:r0 + hL, :] += z["bnd"]; mm_cnt[r0:r0 + hL, :] += z["cnt"]
+            del z; os.remove(ret[wid])
+        cnt = np.maximum(np.asarray(mm_cnt), 1e-6)
+        cov = float((np.asarray(mm_cnt) > 1e-3).mean())
+        cls = np.asarray(mm_cls) / cnt
+        dist = np.asarray(mm_dist) / cnt
+        bnd = np.asarray(mm_bnd) / cnt
+        del mm_cls, mm_dist, mm_bnd, mm_cnt
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    print("[infer] (memmap) merged. /%d cov=%.4f cls%s (%.0fmin)" % (ds, cov, cls.shape, (time.time() - t0) / 60), flush=True)
+    return cls, dist, bnd, tr4, crs, cov
+
+
 def idmap_from_heads(cls, dist, bnd, min_dist=20, peak_thr=0.4, min_area_px=200, ridge=True):
     """全局 idmap: cropland/orchard 用 dist-peak ridge watershed, 其余类用 argmax 连通域。
     复用 dino_parcel_export.build_idmap(全局 /N 网格, downscale=1)。返回 (idmap, cls_of)。"""
@@ -690,7 +836,8 @@ def _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth
                      save_intermediate, dev, t0):
     # 1) 全局推理 + idmap(cuda 多 GPU; 非 cuda 单设备)
     if str(dev).startswith("cuda") and len(list(gpus)) > 1:
-        cls, dist, bnd, tr4, crs, cov = infer_global(mosaic, weights, backbone, downscale, list(gpus))
+        # band-local + 磁盘 memmap(数值逐位一致, 内存 ~1/带数 -> 大市/省级满卡不爆全图累加器)
+        cls, dist, bnd, tr4, crs, cov = infer_global_memmap(mosaic, weights, backbone, downscale, list(gpus))
     else:
         cls, dist, bnd, tr4, crs, cov = infer_single_device(mosaic, weights, backbone, downscale, dev)
     idmap, cls_of = idmap_from_heads(cls, dist, bnd, min_dist, peak_thr, min_area_px, ridge)
