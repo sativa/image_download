@@ -806,7 +806,7 @@ def load_boundary(boundary_arg, utm="EPSG:32648"):
 def run_pipeline(mosaic=None, weights=None, backbone=None, out=None, boundary=None, downscale=4,
                  smooth_iters=2, classes=None, gpus=("0", "1", "2", "3"), utm="EPSG:32648",
                  min_dist=20, peak_thr=0.4, min_area_px=200, ridge=True, tol=5.0,
-                 save_intermediate=None, device="auto", cells_dir=None):
+                 save_intermediate=None, device="auto", cells_dir=None, smooth="coverage"):
     """完整通用管线: (mosaic | cells_dir) -> 无缝标准矢量 GeoParquet。返回 (out_gdf, report)。
 
     device: auto|cuda|mps|cpu。cuda -> 多 GPU 行带并行; mps/cpu -> 单设备整图滑窗。
@@ -825,7 +825,7 @@ def run_pipeline(mosaic=None, weights=None, backbone=None, out=None, boundary=No
     try:
         return _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth_iters,
                                 classes, gpus, utm, min_dist, peak_thr, min_area_px, ridge, tol,
-                                save_intermediate, dev, t0)
+                                save_intermediate, dev, t0, smooth)
     finally:
         if tmp_mosaic and os.path.exists(tmp_mosaic):
             os.remove(tmp_mosaic)
@@ -833,7 +833,7 @@ def run_pipeline(mosaic=None, weights=None, backbone=None, out=None, boundary=No
 
 def _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth_iters,
                      classes, gpus, utm, min_dist, peak_thr, min_area_px, ridge, tol,
-                     save_intermediate, dev, t0):
+                     save_intermediate, dev, t0, smooth="coverage"):
     # 1) 全局推理 + idmap(cuda 多 GPU; 非 cuda 单设备)
     if str(dev).startswith("cuda") and len(list(gpus)) > 1:
         # band-local + 磁盘 memmap(数值逐位一致, 内存 ~1/带数 -> 大市/省级满卡不爆全图累加器)
@@ -844,11 +844,20 @@ def _run_from_mosaic(mosaic, weights, backbone, out, boundary, downscale, smooth
     del cls, dist, bnd
     if save_intermediate:
         np.save(str(Path(save_intermediate) / "idmap.npy"), idmap.astype(np.int32))
-    # 2) 矢量化 + 平滑
-    raw = vectorize_idmap(idmap, cls_of, tr4, crs)
-    del idmap
-    print("[pipeline] vectorized raw: %d polys" % len(raw), flush=True)
-    smoothed = smooth_coverage(raw, tol=tol, iters=smooth_iters)
+    # 2) 矢量化 + 平滑(smooth: coverage=全局一次/向后兼容; auto=按规模自动 全局或分块; tiled=强制分块)
+    if smooth in ("auto", "tiled"):
+        import smooth_dispatch as _sd   # 懒加载:smooth_dispatch 反向 import 本模块,避免循环 import
+        if smooth == "tiled":
+            smoothed = _sd.tiled_smooth_from_idmap(idmap, cls_of, tr4, crs, tol=tol, iters=smooth_iters)
+        else:
+            smoothed = _sd.smooth_auto(idmap, cls_of, tr4, crs, tol=tol, iters=smooth_iters)
+        del idmap
+        print("[pipeline] smoothed(%s): %d polys" % (smooth, len(smoothed)), flush=True)
+    else:
+        raw = vectorize_idmap(idmap, cls_of, tr4, crs)
+        del idmap
+        print("[pipeline] vectorized raw: %d polys" % len(raw), flush=True)
+        smoothed = smooth_coverage(raw, tol=tol, iters=smooth_iters)
     # 3) 可选裁界
     bnd_geom = load_boundary(boundary, utm) if isinstance(boundary, str) else boundary
     if bnd_geom is not None:
@@ -891,6 +900,8 @@ def main():
     ap.add_argument("--min-area-px", type=int, default=200)
     ap.add_argument("--no-ridge", action="store_true")
     ap.add_argument("--save-intermediate", default="", help="保存 idmap.npy 的目录(可选)")
+    ap.add_argument("--smooth", default="coverage", choices=["coverage", "auto", "tiled"],
+                    help="平滑路: coverage=全局一次(默认/向后兼容); auto=按地块数自动(>15万转分块,可扩省级); tiled=强制分块")
     a = ap.parse_args()
     if not a.mosaic and not a.cells_dir:
         ap.error("必须给 --mosaic 或 --cells-dir 之一")
@@ -902,7 +913,8 @@ def main():
                  weights=a.weights, backbone=a.backbone, out=a.out, boundary=a.boundary,
                  device=a.device, downscale=a.downscale, smooth_iters=a.smooth_iters, classes=classes,
                  gpus=a.gpus.split(","), utm=a.utm, min_dist=a.min_dist, peak_thr=a.peak_thr,
-                 min_area_px=a.min_area_px, ridge=not a.no_ridge, tol=a.tol, save_intermediate=si)
+                 min_area_px=a.min_area_px, ridge=not a.no_ridge, tol=a.tol, save_intermediate=si,
+                 smooth=a.smooth)
 
 
 if __name__ == "__main__":
