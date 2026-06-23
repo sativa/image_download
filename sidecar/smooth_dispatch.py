@@ -52,7 +52,7 @@ def _vec_tile(sub, subtr, cls_of):
     return rows
 
 
-def tiled_smooth_from_idmap(idmap, cls_of, tr4, crs, tol=15.0, iters=3,
+def tiled_smooth_from_idmap(idmap, cls_of, tr4, crs, tol=15.0, iters=2,
                             tile_px=DEFAULT_TILE_PX, verbose=True):
     """分块 per-tile smooth + 按全局 ID dissolve -> 曲线 gdf(class_id+geometry, work_crs=源 crs)。
     parcel_id 借 smooth 的 class_id 槽按位 carry(避开脆弱质心 sjoin),平滑后类别取自 cls_of(权威)。"""
@@ -96,7 +96,7 @@ def tiled_smooth_from_idmap(idmap, cls_of, tr4, crs, tol=15.0, iters=3,
     return diss
 
 
-def smooth_auto(idmap, cls_of, tr4, crs, tol=15.0, iters=3,
+def smooth_auto(idmap, cls_of, tr4, crs, tol=15.0, iters=2,
                 max_global_parcels=DEFAULT_MAX_GLOBAL_PARCELS,
                 tile_px=DEFAULT_TILE_PX, verbose=True):
     """自动分流:地块数 ≤ 阈值 -> 全局 smooth_coverage(最干净/面积最准);否则 -> 分块 smooth(可扩省级)。

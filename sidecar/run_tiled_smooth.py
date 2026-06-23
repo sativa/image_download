@@ -67,7 +67,7 @@ def main():
             hij = gpd.GeoDataFrame({"class_id": rawt["parcel_id"].astype("int64").values},
                                    geometry=rawt.geometry.values, crs=crs)
             try:
-                smt = pp.smooth_coverage(hij, tol=TOL, iters=3)   # 块内曲线;class_id 实为 parcel_id
+                smt = pp.smooth_coverage(hij, tol=TOL, iters=1)   # 块内曲线(iters=1:轻柔单次倒角,体积小);class_id 实为 parcel_id
                 if "class_id" not in smt.columns or len(smt) == 0:
                     raise RuntimeError("carry-lost")
                 smt = smt.rename(columns={"class_id": "parcel_id"})[["parcel_id", "geometry"]]
