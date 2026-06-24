@@ -101,6 +101,15 @@ struct BatchArgs {
     /// `--classify [backend]`: after downloading, run the trained model over every cell tif
     /// (same python sidecar the GUI uses) and emit per-parcel polygons. None = download only.
     classify: Option<String>,
+    /// Post-download quality control: detect blank/black/missing cells and re-fetch them
+    /// (cross-source fallback) so the mosaic has no blank blocks. Default on.
+    qc: bool,
+    /// A cell whose mean RGB brightness (0..255) is below this is treated as blank/black
+    /// and re-fetched. Default 20 (real imagery is ~60-120; bad tiles ~0-19).
+    qc_brightness: f32,
+    /// During QC, if a cell is still blank after re-fetching the primary source, try the
+    /// other source (esri↔google) into the same file. Default on.
+    qc_fallback: bool,
 }
 
 impl BatchArgs {
@@ -128,7 +137,8 @@ imagery-downloader batch — headless bulk tile download
 USAGE:
     imagery-downloader batch --regions <regions.json> --out <dir> \\
         [--source esri|google|auto] [--zoom <8-23>] [--concurrency <N>] \\
-        [--retry-per-tile <N>] [--compress jpeg|deflate|none] [--quality <1-100>]
+        [--retry-per-tile <N>] [--compress jpeg|deflate|none] [--quality <1-100>] \\
+        [--no-qc] [--qc-brightness <0-255>] [--no-qc-fallback]
 
 OPTIONS:
     --regions <PATH>     JSON: array of cells, or {train:[...],test:[...]}.
@@ -142,6 +152,12 @@ OPTIONS:
                          3-band, ~2x) | none (uncompressed RGBA 4-band)
                          [default: jpeg]
     --quality <Q>        JPEG quality 1..100 (compress=jpeg only) [default: 95]
+    --no-qc              Disable post-download QC (blank/black/missing cell
+                         detection + re-fetch). QC is ON by default.
+    --qc-brightness <B>  Cells with mean RGB brightness < B (0..255) are treated
+                         as blank/black and re-fetched [default: 20].
+    --no-qc-fallback     During QC, don't try the other source (esri<->google)
+                         for cells still blank after re-fetching the primary.
     --classify [B]       After downloading, classify with the trained model.
                          Trained backends (parcel_dist|cropland|parcel_bh|parcel|
                          landcover) now produce ONE SEAMLESS COUNTY coverage:
@@ -172,6 +188,9 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
     let mut compress = "jpeg".to_string();
     let mut quality: u8 = 95;
     let mut classify: Option<String> = None;
+    let mut qc = true;
+    let mut qc_brightness: f32 = 20.0;
+    let mut qc_fallback = true;
 
     // Grab the value following the flag at index `i`, advancing `i` past it.
     fn value_at(argv: &[String], i: &mut usize, name: &str) -> Result<String, String> {
@@ -220,6 +239,13 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
                     .parse()
                     .map_err(|_| "--quality must be an integer".to_string())?
             }
+            "--no-qc" => qc = false,
+            "--no-qc-fallback" => qc_fallback = false,
+            "--qc-brightness" => {
+                qc_brightness = value_at(argv, &mut i, "--qc-brightness")?
+                    .parse()
+                    .map_err(|_| "--qc-brightness must be a number".to_string())?
+            }
             other => return Err(format!("unknown argument: {other}\n\n{USAGE}")),
         }
         i += 1;
@@ -244,6 +270,9 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
     if !(1..=100).contains(&quality) {
         return Err(format!("--quality {quality} out of range 1..=100"));
     }
+    if !(0.0..=255.0).contains(&qc_brightness) {
+        return Err(format!("--qc-brightness {qc_brightness} out of range 0..=255"));
+    }
     if let Some(b) = &classify {
         match b.as_str() {
             "parcel_dist" | "cropland" | "parcel_bh" | "parcel" | "landcover" => {}
@@ -260,6 +289,9 @@ fn parse_args(argv: &[String]) -> Result<BatchArgs, String> {
         compress,
         quality,
         classify,
+        qc,
+        qc_brightness,
+        qc_fallback,
     })
 }
 
@@ -300,9 +332,32 @@ pub fn run_batch() -> ! {
 
 /// Outcome of one cell, for the run summary.
 enum CellResult {
-    Wrote,
+    /// Wrote a tif. `brightness` is the mean RGB (0..255) of the stitched image —
+    /// QC uses it to flag blank/black cells.
+    Wrote { brightness: f32 },
     Skipped,
     Failed,
+}
+
+/// Mean RGB brightness (0..255) over an image. A blank/black tile (source served
+/// no imagery, or every tile request failed → transparent) scores near 0; real
+/// imagery is ~60-120. Transparent pixels count as 0 so half-missing cells score low too.
+fn mean_brightness(img: &image::RgbaImage) -> f32 {
+    let mut sum: u64 = 0;
+    for px in img.pixels() {
+        let [r, g, b, a] = px.0;
+        // Treat transparent (failed-tile) pixels as black.
+        if a == 0 {
+            continue;
+        }
+        sum += (r as u64 + g as u64 + b as u64) / 3;
+    }
+    let n = (img.width() as u64) * (img.height() as u64);
+    if n == 0 {
+        0.0
+    } else {
+        sum as f32 / n as f32
+    }
 }
 
 async fn run_batch_async(args: BatchArgs) -> i32 {
@@ -360,6 +415,9 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
     let mut wrote = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
+    // Cells that need a QC re-fetch: the download failed (no tif) or the stitched
+    // image is blank/black (brightness below threshold). Stored as region indices.
+    let mut bad: Vec<usize> = Vec::new();
 
     for (n, region) in regions.iter().enumerate() {
         let out_path = cell_output_path(&args.out, region, source);
@@ -377,22 +435,87 @@ async fn run_batch_async(args: BatchArgs) -> i32 {
             args.retry_per_tile,
             compression,
             &out_path,
+            false,
         )
         .await
         {
-            CellResult::Wrote => {
-                wrote += 1;
-                eprintln!("[batch] {label}  ✓ wrote");
+            CellResult::Wrote { brightness } => {
+                if args.qc && brightness < args.qc_brightness {
+                    bad.push(n);
+                    eprintln!("[batch] {label}  ⚠ blank (brightness {brightness:.0} < {:.0}) — queued for QC", args.qc_brightness);
+                } else {
+                    wrote += 1;
+                    eprintln!("[batch] {label}  ✓ wrote");
+                }
             }
             CellResult::Skipped => {
                 skipped += 1;
                 eprintln!("[batch] {label}  • skip (exists)");
             }
             CellResult::Failed => {
-                failed += 1;
-                eprintln!("[batch] {label}  ✗ FAILED");
+                if args.qc {
+                    bad.push(n);
+                    eprintln!("[batch] {label}  ⚠ failed — queued for QC");
+                } else {
+                    failed += 1;
+                    eprintln!("[batch] {label}  ✗ FAILED");
+                }
             }
         }
+    }
+
+    // ── QC pass: re-fetch every blank/failed cell (primary source, then the other
+    //    source as a fallback) so the mosaic has no blank/black blocks. ──
+    if args.qc && !bad.is_empty() {
+        eprintln!(
+            "[batch][qc] {} blank/failed cell(s); re-fetching (threshold {:.0}, fallback {})…",
+            bad.len(),
+            args.qc_brightness,
+            if args.qc_fallback { source.alternate().as_str() } else { "off" },
+        );
+        for &n in &bad {
+            let region = &regions[n];
+            let out_path = cell_output_path(&args.out, region, source);
+            let label = out_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let mut best = -1.0f32; // brightness of the best attempt so far
+            // 1) re-fetch the primary source a couple of times (transient blanks/gaps).
+            for _ in 0..2 {
+                if let CellResult::Wrote { brightness } = download_one_cell(
+                    region, source, args.zoom, args.concurrency, args.retry_per_tile,
+                    compression, &out_path, true,
+                ).await {
+                    best = best.max(brightness);
+                    if brightness >= args.qc_brightness {
+                        break;
+                    }
+                }
+            }
+            // 2) still blank → try the other provider into the same file.
+            if best < args.qc_brightness && args.qc_fallback {
+                let alt = source.alternate();
+                if let CellResult::Wrote { brightness } = download_one_cell(
+                    region, alt, args.zoom, args.concurrency, args.retry_per_tile,
+                    compression, &out_path, true,
+                ).await {
+                    if brightness >= args.qc_brightness {
+                        best = brightness;
+                        eprintln!("[batch][qc] {label}  ✓ fixed via {} (brightness {brightness:.0})", alt.as_str());
+                    } else {
+                        best = best.max(brightness);
+                    }
+                }
+            }
+            if best >= args.qc_brightness {
+                wrote += 1;
+                eprintln!("[batch][qc] {label}  ✓ ok (brightness {best:.0})");
+            } else {
+                failed += 1;
+                eprintln!("[batch][qc] {label}  ✗ STILL BLANK (best brightness {best:.0}) — no imagery in either source?");
+            }
+        }
+    } else if !bad.is_empty() {
+        // QC disabled: count the queued-bad cells as failures.
+        failed += bad.len();
     }
 
     eprintln!(
@@ -446,8 +569,9 @@ async fn download_one_cell(
     retry_per_tile: u32,
     compression: Compression,
     out_path: &Path,
+    force: bool,
 ) -> CellResult {
-    if out_path.exists() {
+    if !force && out_path.exists() {
         return CellResult::Skipped;
     }
     let bbox = region.bbox;
@@ -494,8 +618,9 @@ async fn download_one_cell(
     let outer_3857 = bbox_3857_from_range(range);
     let (img, bbox_3857) = crop_to_user_bbox(img, outer_3857, bbox);
 
+    let brightness = mean_brightness(&img);
     match write_cog(&img, &CogParams { bbox_3857, zoom }, compression, out_path) {
-        Ok(()) => CellResult::Wrote,
+        Ok(()) => CellResult::Wrote { brightness },
         Err(e) => {
             eprintln!(
                 "[batch]   write_cog failed for {}: {e}",
@@ -871,6 +996,50 @@ mod tests {
         };
         let p = cell_output_path(Path::new("/tmp"), &r, SourceKind::Esri);
         assert_eq!(p.file_name().unwrap(), "a_b_c_0_esri.tif");
+    }
+
+    #[test]
+    fn qc_on_by_default() {
+        let a = parse_args(&["--regions".into(), "r.json".into(), "--out".into(), "/tmp".into()]).unwrap();
+        assert!(a.qc);
+        assert_eq!(a.qc_brightness, 20.0);
+        assert!(a.qc_fallback);
+    }
+
+    #[test]
+    fn qc_flags_parse() {
+        let a = parse_args(&[
+            "--regions".into(), "r.json".into(), "--out".into(), "/tmp".into(),
+            "--no-qc".into(), "--qc-brightness".into(), "35".into(), "--no-qc-fallback".into(),
+        ]).unwrap();
+        assert!(!a.qc);
+        assert_eq!(a.qc_brightness, 35.0);
+        assert!(!a.qc_fallback);
+    }
+
+    #[test]
+    fn qc_brightness_range_validated() {
+        assert!(parse_args(&[
+            "--regions".into(), "r.json".into(), "--out".into(), "/tmp".into(),
+            "--qc-brightness".into(), "999".into(),
+        ]).is_err());
+    }
+
+    #[test]
+    fn mean_brightness_flags_blank() {
+        use image::{Rgba, RgbaImage};
+        let black = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        let bright = RgbaImage::from_pixel(8, 8, Rgba([90, 90, 90, 255]));
+        let transparent = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+        assert!(mean_brightness(&black) < 20.0);
+        assert!(mean_brightness(&bright) >= 20.0);
+        assert!(mean_brightness(&transparent) < 20.0); // failed tiles -> blank
+    }
+
+    #[test]
+    fn source_alternate_flips() {
+        assert_eq!(SourceKind::Esri.alternate(), SourceKind::Google);
+        assert_eq!(SourceKind::Google.alternate(), SourceKind::Esri);
     }
 
     #[test]

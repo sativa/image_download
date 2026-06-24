@@ -23,6 +23,15 @@ impl SourceKind {
             _ => None,
         }
     }
+
+    /// The other provider — used as a QC fallback when one source serves a
+    /// blank/black tile for a cell.
+    pub fn alternate(self) -> SourceKind {
+        match self {
+            SourceKind::Esri => SourceKind::Google,
+            SourceKind::Google => SourceKind::Esri,
+        }
+    }
 }
 
 /// Build the XYZ URL for one tile from one source.
